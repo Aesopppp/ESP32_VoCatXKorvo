@@ -1,0 +1,23 @@
+version: "1.0.0"
+description: "YMOS voice assistant port for ESP-VoCat v1.2 (headless)"
+
+dependencies:
+  # Core ESP-IDF
+  idf:
+    version: ">=6.1.0,<6.2.0"
+
+  # Audio codec abstraction (ES7210 ADC + ES8311 DAC)
+  espressif/esp_codec_dev:
+    version: "^1.6.2"
+
+  # Wake word detection (WakeNet) + AFE VAD pipeline
+  # 注意：esp-sr 需要在 menuconfig 中配置模型路径
+  #   -> Component config -> ESP Speech Recognition -> Select wake words
+  #     常用模型：wn9_hilexin（你好小E）/ wn9_hiesp（你好小智）
+  espressif/esp-sr:
+    version: ">=2.5.3"
+
+  # WebSocket 客户端（IDF 6.1 继续作为独立组件使用）
+  # 注意：组件名是 esp_websocket_client（下划线），不是 esp-websocket-client（连字符）
+  espressif/esp_websocket_client:
+    version: "^1.8.0"

@@ -1,0 +1,17 @@
+/build*/
+/managed_components/
+/work/
+/.vscode/
+/sdkconfig.old
+*.log
+/buildlog.txt
+*.bak
+*.tmp
+.DS_Store
+Thumbs.db
+.env
+.env.*
+__pycache__/
+/main/wifi_local_config.h
+/main/acos_local_config.h
+/main/acos_reminder_local_config.h

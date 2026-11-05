@@ -1,0 +1,12 @@
+/* 复制为 acos_local_config.h 并填写密钥；该本地文件已加入 .gitignore。
+ * 相同预设编号只应用一次。以后更换地址/密钥时递增编号，再编译烧录；
+ * 更新范围仅限 ws_url / acos_token，保留 Wi-Fi、音量和设备身份。
+ */
+#ifndef ACOS_LOCAL_CONFIG_H
+#define ACOS_LOCAL_CONFIG_H
+
+#define LOCAL_ACOS_PRESET_ID 1u
+#define LOCAL_ACOS_WS_URL ACOS_WS_URL
+#define LOCAL_ACOS_TOKEN ""
+
+#endif

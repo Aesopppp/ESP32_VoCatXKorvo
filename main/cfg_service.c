@@ -1,0 +1,454 @@
+/**
+ * cfg_service.c — NVS 配置管理实现
+ */
+
+#include "cfg_service.h"
+#include "board_config.h"
+#include "event_bus.h"
+
+#include <string.h>
+#include <stdio.h>
+
+#include "esp_log.h"
+#include "esp_mac.h"
+#include "esp_err.h"
+#include "nvs.h"
+#include "nvs_flash.h"
+
+/* 本机调试凭据不进 Git；未提供此文件的构建保持原有配网流程。 */
+#if __has_include("wifi_local_config.h")
+#include "wifi_local_config.h"
+#endif
+#if __has_include("acos_local_config.h")
+#include "acos_local_config.h"
+#endif
+
+static const char *TAG = "cfg_service";
+
+/* ── 内部常量 ─────────────────────────────────────────────────────────────── */
+
+#define NVS_PARTITION     "nvs"
+#define NVS_NAMESPACE     "korvo_cfg"
+#define MAX_STR_LEN       256
+#define CFG_SCHEMA_KEY     "schema_ver"
+
+/* ── 键名字符串映射表 ─────────────────────────────────────────────────────── */
+
+static const char *s_key_names[] = {
+    "wifi_ssid",
+    "wifi_pass",
+    "acos_token",
+    "ws_url",
+    "device_id",
+    "room_id",
+    "model",
+    "vad_enable",
+    "barge_in_enable",
+    "led_mode",
+    "volume",
+    "paired",
+    "last_err",
+    "mqtt_enabled", "mqtt_host", "mqtt_port", "mqtt_client_id",
+    "mqtt_username", "mqtt_password", "mqtt_base_topic", "chip_id",
+    "rm_enabled", "rm_uri", "rm_api_key", "rm_token", "rm_username", "rm_password",
+    "",
+};
+
+const char *cfg_key_to_str(cfg_key_t key)
+{
+    if (key >= 0 && key < CFG_KEY_MAX) {
+        return s_key_names[key];
+    }
+    return "unknown";
+}
+
+/* ── NVS 句柄 ─────────────────────────────────────────────────────────────── */
+
+static nvs_handle_t s_nvs_handle = 0;
+static bool s_inited = false;
+
+/* ── 内部工具 ─────────────────────────────────────────────────────────────── */
+
+static esp_err_t ensure_open(void)
+{
+    if (s_inited) return ESP_OK;
+    return nvs_open(NVS_NAMESPACE, NVS_READWRITE, &s_nvs_handle);
+}
+
+static esp_err_t apply_local_wifi_preset(void)
+{
+#ifdef LOCAL_WIFI_PRESET_ID
+    _Static_assert(LOCAL_WIFI_PRESET_ID > 0, "Wi-Fi preset ID must be positive");
+    _Static_assert(sizeof(LOCAL_WIFI_SSID) > 1 && sizeof(LOCAL_WIFI_SSID) <= 32,
+                   "Wi-Fi preset SSID must contain 1 to 31 bytes");
+    _Static_assert(sizeof(LOCAL_WIFI_PASSWORD) == 1 ||
+                       (sizeof(LOCAL_WIFI_PASSWORD) >= 9 && sizeof(LOCAL_WIFI_PASSWORD) <= 64),
+                   "Wi-Fi preset password must be empty or contain 8 to 63 bytes");
+
+    /* 相同预设只应用一次：覆盖旧 Wi-Fi，但不覆盖用户之后通过网页保存的网络。
+     * 仅写 Wi-Fi 和应用标记，不擦除 ACOS、MQTT、设备身份等配置。
+     */
+    uint32_t applied_id = 0;
+    esp_err_t err = nvs_get_u32(s_nvs_handle, "wifi_preset_id", &applied_id);
+    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) return err;
+    if (applied_id == LOCAL_WIFI_PRESET_ID) return ESP_OK;
+
+    err = nvs_set_str(s_nvs_handle, "wifi_ssid", LOCAL_WIFI_SSID);
+    if (err != ESP_OK) return err;
+    err = nvs_set_str(s_nvs_handle, "wifi_pass", LOCAL_WIFI_PASSWORD);
+    if (err != ESP_OK) return err;
+    /* 标记最后写入；此前失败时下次启动仍会重新应用完整凭据。 */
+    err = nvs_set_u32(s_nvs_handle, "wifi_preset_id", LOCAL_WIFI_PRESET_ID);
+    if (err != ESP_OK) return err;
+    err = nvs_commit(s_nvs_handle);
+    if (err != ESP_OK) return err;
+
+    ESP_LOGI(TAG, "Local Wi-Fi preset applied once (SSID='%s')", LOCAL_WIFI_SSID);
+#endif
+    return ESP_OK;
+}
+
+/* 在 WebSocket 初始化前应用完整预设，处理旧地址和已存在的空 token。
+ * 网络服务只在 cfg_service_init 成功后启动，因此写入失败时不会带着
+ * 半组配置连接平台。相同编号不反复覆盖后续用户设置。
+ */
+static esp_err_t apply_local_acos_preset(void)
+{
+#ifdef LOCAL_ACOS_PRESET_ID
+    _Static_assert(LOCAL_ACOS_PRESET_ID > 0, "ACOS preset ID must be positive");
+    _Static_assert(sizeof(LOCAL_ACOS_WS_URL) > 1 && sizeof(LOCAL_ACOS_WS_URL) <= 256,
+                   "ACOS preset URL must contain 1 to 255 bytes");
+    _Static_assert(sizeof(LOCAL_ACOS_TOKEN) > 1 && sizeof(LOCAL_ACOS_TOKEN) <= 256,
+                   "ACOS preset token must contain 1 to 255 bytes");
+
+    uint32_t applied_id = 0;
+    esp_err_t err = nvs_get_u32(s_nvs_handle, "acos_preset_id", &applied_id);
+    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) return err;
+    if (applied_id == LOCAL_ACOS_PRESET_ID) return ESP_OK;
+
+    err = nvs_set_str(s_nvs_handle, "ws_url", LOCAL_ACOS_WS_URL);
+    if (err != ESP_OK) return err;
+    err = nvs_set_str(s_nvs_handle, "acos_token", LOCAL_ACOS_TOKEN);
+    if (err != ESP_OK) return err;
+    err = nvs_commit(s_nvs_handle);
+    if (err != ESP_OK) return err;
+
+    /* 配置提交成功后，再单独提交完成标记。多键写入并非原子事务；
+     * 中途掉电时标记尚未保存，下次启动会重新写入整组预设。
+     */
+    err = nvs_set_u32(s_nvs_handle, "acos_preset_id", LOCAL_ACOS_PRESET_ID);
+    if (err != ESP_OK) return err;
+    err = nvs_commit(s_nvs_handle);
+    if (err != ESP_OK) return err;
+
+    ESP_LOGI(TAG, "Local ACOS preset applied once (id=%lu); endpoint/token saved",
+             (unsigned long)LOCAL_ACOS_PRESET_ID);
+#endif
+    return ESP_OK;
+}
+
+/* ── 公开 API ─────────────────────────────────────────────────────────────── */
+
+esp_err_t cfg_service_init(void)
+{
+    esp_err_t err = nvs_flash_init_partition(NVS_PARTITION);
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_LOGW(TAG, "NVS partition needs erase, re-initializing...");
+        ESP_ERROR_CHECK(nvs_flash_erase_partition(NVS_PARTITION));
+        err = nvs_flash_init_partition(NVS_PARTITION);
+    }
+    ESP_ERROR_CHECK(err);
+
+    err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &s_nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "nvs_open failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    /* 首次启动：用编译期默认值填充空白配置 */
+    s_inited = true;
+    cfg_service_migrate();
+    err = apply_local_wifi_preset();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Local Wi-Fi preset failed: %s", esp_err_to_name(err));
+        nvs_close(s_nvs_handle);
+        s_nvs_handle = 0;
+        s_inited = false;
+        return err;
+    }
+    err = apply_local_acos_preset();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Local ACOS preset failed: %s", esp_err_to_name(err));
+        nvs_close(s_nvs_handle);
+        s_nvs_handle = 0;
+        s_inited = false;
+        return err;
+    }
+    char tmp[256] = {0};
+    if (nvs_get_str(s_nvs_handle, "wifi_ssid", tmp, &(size_t){sizeof(tmp)}) == ESP_ERR_NVS_NOT_FOUND) {
+        cfg_service_set_str(CFG_KEY_WIFI_SSID, DEFAULT_WIFI_SSID);
+        cfg_service_set_str(CFG_KEY_WIFI_PASSWORD, DEFAULT_WIFI_PASSWORD);
+        ESP_LOGI(TAG, "NVS: WiFi defaults written (SSID='%s')", DEFAULT_WIFI_SSID);
+    }
+    if (nvs_get_str(s_nvs_handle, "acos_token", tmp, &(size_t){sizeof(tmp)}) == ESP_ERR_NVS_NOT_FOUND) {
+        cfg_service_set_str(CFG_KEY_ACOS_TOKEN, DEFAULT_ACOS_TOKEN);
+        ESP_LOGI(TAG, "NVS: ACOS token default written");
+    }
+
+
+    ESP_LOGI(TAG, "cfg_service init ok (partition='%s')", NVS_PARTITION);
+    return ESP_OK;
+}
+
+esp_err_t cfg_service_migrate(void)
+{
+    if (!s_inited) return ESP_ERR_INVALID_STATE;
+    uint16_t version = 0;
+    esp_err_t err = nvs_get_u16(s_nvs_handle, CFG_SCHEMA_KEY, &version);
+    if (err == ESP_ERR_NVS_NOT_FOUND) version = 1;
+    if (version < CFG_SCHEMA_VERSION) {
+        /* Version 1 stored mqtt_port as i32; keep that representation so
+         * existing devices can migrate without an NVS type collision. */
+        nvs_set_u16(s_nvs_handle, CFG_SCHEMA_KEY, CFG_SCHEMA_VERSION);
+        err = nvs_commit(s_nvs_handle);
+        ESP_LOGI(TAG, "NVS schema migrated %u -> %u", version, CFG_SCHEMA_VERSION);
+        return err;
+    }
+    return ESP_OK;
+}
+
+esp_err_t cfg_service_load(ymos_config_t *out)
+{
+    if (!out || !s_inited) return ESP_ERR_INVALID_ARG;
+    memset(out, 0, sizeof(*out));
+    out->schema_version = CFG_SCHEMA_VERSION;
+    cfg_get_wifi_credential(out->wifi_ssid, sizeof(out->wifi_ssid), out->wifi_password, sizeof(out->wifi_password));
+    cfg_service_get_str(CFG_KEY_ACOS_TOKEN, out->acos_token, sizeof(out->acos_token), DEFAULT_ACOS_TOKEN);
+    cfg_service_get_str(CFG_KEY_WS_URL, out->ws_url, sizeof(out->ws_url), ACOS_WS_URL);
+    cfg_service_get_str(CFG_KEY_DEVICE_ID, out->device_id, sizeof(out->device_id), "");
+    cfg_service_get_str(CFG_KEY_MQTT_HOST, out->mqtt_host, sizeof(out->mqtt_host), "mqtt://broker.emqx.io");
+    out->mqtt_port = (uint16_t)cfg_service_get_int(CFG_KEY_MQTT_PORT, 1883);
+    cfg_service_get_str(CFG_KEY_MQTT_CLIENT_ID, out->mqtt_client_id, sizeof(out->mqtt_client_id), "");
+    cfg_service_get_str(CFG_KEY_MQTT_USERNAME, out->mqtt_username, sizeof(out->mqtt_username), "");
+    cfg_service_get_str(CFG_KEY_MQTT_PASSWORD, out->mqtt_password, sizeof(out->mqtt_password), "");
+    cfg_service_get_str(CFG_KEY_MQTT_BASE_TOPIC, out->mqtt_base_topic, sizeof(out->mqtt_base_topic), "ymos/v1");
+    out->mqtt_enabled = cfg_service_get_bool(CFG_KEY_MQTT_ENABLED, true);
+    out->paired = cfg_service_is_paired();
+    return ESP_OK;
+}
+
+esp_err_t cfg_service_save(const ymos_config_t *c)
+{
+    if (!c || !s_inited || !c->wifi_ssid[0] || strlen(c->wifi_ssid) >= sizeof(c->wifi_ssid) || c->mqtt_port == 0) return ESP_ERR_INVALID_ARG;
+    nvs_set_str(s_nvs_handle, "wifi_ssid", c->wifi_ssid); nvs_set_str(s_nvs_handle, "wifi_pass", c->wifi_password);
+    nvs_set_i32(s_nvs_handle, "paired", c->paired ? 1 : 0); nvs_set_u16(s_nvs_handle, CFG_SCHEMA_KEY, CFG_SCHEMA_VERSION);
+    return nvs_commit(s_nvs_handle);
+}
+
+size_t cfg_service_get_str(cfg_key_t key, char *out, size_t out_size, const char *def)
+{
+    if (!out || out_size == 0) return 0;
+    out[0] = '\0';
+
+    if (!s_inited) return 0;
+
+    const char *nvs_key = cfg_key_to_str(key);
+    size_t required_size = out_size;
+
+    esp_err_t err = nvs_get_str(s_nvs_handle, nvs_key, out, &required_size);
+    if (err == ESP_OK) {
+        return required_size > 0 ? required_size - 1 : 0;
+    } else if (err == ESP_ERR_NVS_NOT_FOUND) {
+        if (def) {
+            strncpy(out, def, out_size - 1);
+            out[out_size - 1] = '\0';
+            return strlen(out);
+        }
+    }
+    (void)err;
+    return 0;
+}
+
+esp_err_t cfg_service_set_str(cfg_key_t key, const char *value)
+{
+    if (!s_inited) return ESP_ERR_INVALID_STATE;
+    if (!value) return ESP_ERR_INVALID_ARG;
+
+    const char *nvs_key = cfg_key_to_str(key);
+    esp_err_t err = nvs_set_str(s_nvs_handle, nvs_key, value);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "nvs_set_str('%s') failed: %s", nvs_key, esp_err_to_name(err));
+        return err;
+    }
+
+    err = nvs_commit(s_nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "nvs_commit failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    /* 配置可能包含 Wi-Fi、WebSocket 或 MQTT 凭据，不输出值。 */
+    ESP_LOGD(TAG, "cfg '%s' updated", nvs_key);
+    return ESP_OK;
+}
+
+int cfg_service_get_int(cfg_key_t key, int def)
+{
+    if (!s_inited) return def;
+
+    const char *nvs_key = cfg_key_to_str(key);
+    int32_t val = def;
+
+    esp_err_t err = nvs_get_i32(s_nvs_handle, nvs_key, &val);
+    if (err == ESP_OK) {
+        return (int)val;
+    }
+    return def;
+}
+
+esp_err_t cfg_service_set_int(cfg_key_t key, int value)
+{
+    if (!s_inited) return ESP_ERR_INVALID_STATE;
+
+    const char *nvs_key = cfg_key_to_str(key);
+    esp_err_t err = nvs_set_i32(s_nvs_handle, nvs_key, (int32_t)value);
+    if (err != ESP_OK) return err;
+
+    return nvs_commit(s_nvs_handle);
+}
+
+bool cfg_service_get_bool(cfg_key_t key, bool def)
+{
+    if (!s_inited) return def;
+
+    const char *nvs_key = cfg_key_to_str(key);
+    int32_t val = def ? 1 : 0;
+
+    esp_err_t err = nvs_get_i32(s_nvs_handle, nvs_key, &val);
+    if (err == ESP_OK) {
+        return val != 0;
+    }
+    return def;
+}
+
+esp_err_t cfg_service_set_bool(cfg_key_t key, bool value)
+{
+    return cfg_service_set_int(key, value ? 1 : 0);
+}
+
+esp_err_t cfg_service_erase(cfg_key_t key)
+{
+    if (!s_inited) return ESP_ERR_INVALID_STATE;
+
+    const char *nvs_key = cfg_key_to_str(key);
+    esp_err_t err = nvs_erase_key(s_nvs_handle, nvs_key);
+    if (err != ESP_OK) return err;
+
+    return nvs_commit(s_nvs_handle);
+}
+
+esp_err_t cfg_service_erase_all(void)
+{
+    if (!s_inited) return ESP_ERR_INVALID_STATE;
+
+    esp_err_t err = nvs_erase_all(s_nvs_handle);
+    if (err != ESP_OK) return err;
+
+    return nvs_commit(s_nvs_handle);
+}
+
+bool cfg_service_is_paired(void)
+{
+    return cfg_service_get_bool(CFG_KEY_PAIRED, false);
+}
+
+esp_err_t cfg_service_mark_paired(void)
+{
+    ESP_LOGI(TAG, "Marking device as paired");
+    return cfg_service_set_bool(CFG_KEY_PAIRED, true);
+}
+
+/* ── Wi-Fi 凭据（NVS + 编译期默认值兜底） ─────────────────────────────────── */
+
+void cfg_get_wifi_credential(char *ssid_out, size_t ssid_size,
+                             char *pass_out, size_t pass_size)
+{
+    if (ssid_out && ssid_size > 0) {
+        cfg_service_get_str(CFG_KEY_WIFI_SSID, ssid_out, ssid_size,
+                           DEFAULT_WIFI_SSID);
+    }
+    if (pass_out && pass_size > 0) {
+        cfg_service_get_str(CFG_KEY_WIFI_PASSWORD, pass_out, pass_size,
+                           DEFAULT_WIFI_PASSWORD);
+    }
+}
+
+esp_err_t cfg_service_get_identity(char *chip_id, size_t chip_size,
+                                   char *device_id, size_t device_size,
+                                   char *client_id, size_t client_size)
+{
+    if (!s_inited || !chip_id || !device_id || !client_id ||
+        chip_size < 13 || device_size < 6 || client_size < 6) return ESP_ERR_INVALID_ARG;
+    uint8_t mac[6];
+    esp_err_t err = esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    if (err != ESP_OK) return err;
+    snprintf(chip_id, chip_size, "%02X%02X%02X%02X%02X%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    char derived[48];
+    snprintf(derived, sizeof(derived), "ymos-%s", chip_id);
+    cfg_service_get_str(CFG_KEY_DEVICE_ID, device_id, device_size, derived);
+    if (device_id[0] == '\0') {
+        cfg_service_set_str(CFG_KEY_DEVICE_ID, derived);
+        strncpy(device_id, derived, device_size - 1); device_id[device_size - 1] = 0;
+    }
+    char client_default[64];
+    snprintf(client_default, sizeof(client_default), "ymos-%s", chip_id);
+    cfg_service_get_str(CFG_KEY_MQTT_CLIENT_ID, client_id, client_size, client_default);
+    if (client_id[0] == '\0') {
+        cfg_service_set_str(CFG_KEY_MQTT_CLIENT_ID, client_default);
+        strncpy(client_id, client_default, client_size - 1); client_id[client_size - 1] = 0;
+    }
+    cfg_service_set_str(CFG_KEY_CHIP_ID, chip_id);
+    return ESP_OK;
+}
+
+/* ── ACOS 服务器信息（host 从 ws_url 解析） ───────────────────────────────── */
+
+void cfg_get_acos_server(char *host_out, size_t host_size,
+                         char *token_out, size_t token_size)
+{
+    /* 优先用 ws_url，否则用编译期默认值 */
+    char url_buf[256] = {0};
+    cfg_service_get_str(CFG_KEY_WS_URL, url_buf, sizeof(url_buf), ACOS_WS_URL);
+
+    /* 解析 wss://host[:port]/path → host 部分 */
+    if (host_out && host_size > 0) {
+        const char *p = url_buf;
+        /* 跳过协议前缀 */
+        if (strncmp(p, "wss://", 6) == 0)      p += 6;
+        else if (strncmp(p, "ws://", 5) == 0)  p += 5;
+
+        /* 找到第一个 / 或 : 或字符串末尾即为 host 结束 */
+        const char *end = p;
+        while (*end && *end != '/' && *end != ':') end++;
+
+        size_t len = (size_t)(end - p);
+        if (len >= host_size) len = host_size - 1;
+        memcpy(host_out, p, len);
+        host_out[len] = '\0';
+    }
+
+    /* Token 直接读 NVS */
+    if (token_out && token_size > 0) {
+        cfg_service_get_str(CFG_KEY_ACOS_TOKEN, token_out, token_size, DEFAULT_ACOS_TOKEN);
+    }
+}
+
+esp_err_t cfg_service_deinit(void)
+{
+    if (s_inited) {
+        nvs_close(s_nvs_handle);
+        s_inited = false;
+    }
+    return ESP_OK;
+}
