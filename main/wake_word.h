@@ -105,6 +105,23 @@ void wake_word_deinit(void);
  * @return RingbufHandle_t，唤醒词初始化前为 NULL
  */
 RingbufHandle_t wake_word_get_ringbuf(void);
+/* 单调采样位置只用于当前缓存生命周期；清空缓存时同步复位。所有访问均由
+ * 缓存锁串行化，调用者不能持锁等待网络。speech_end 是 AFE 判为人声且能量
+ * 达到诊断门限的最后一帧末端，不表示识别出了完整语义。 */
+typedef struct {
+    uint32_t written_end;
+    uint32_t read_end;
+    uint32_t speech_end;
+} wake_word_audio_progress_t;
+void wake_word_get_audio_progress(wake_word_audio_progress_t *progress);
+/** 主任务在本轮回答候选到达后开始观察；只计新 AFE 帧，不重新处理 FIFO。
+ * 返回非零观察代次，结束/查询需同一代次；缓存复位会使旧观察失效。 */
+uint32_t wake_word_watch_input_handoff(void);
+void wake_word_end_input_handoff(uint32_t id);
+bool wake_word_get_input_handoff(uint32_t id, bool *pending, bool *confirmed);
+/** audio_in 唯一消费者：非阻塞复制一帧并归还项，返回字节数及末端采样位置。
+ * 返回 0 表示无帧；返回值大于 capacity 时未复制，消费者必须报错。 */
+size_t wake_word_read_audio(int16_t *pcm, size_t capacity, uint32_t *sample_end);
 /** Flush stale PCM with the upload task stopped. */
 void wake_word_clear_audio_buffer(void);
 

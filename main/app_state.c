@@ -231,12 +231,6 @@ esp_err_t app_state_back_to_wait_wake(bool from_timer)
 {
     app_state_t prev = app_state_get();
 
-    /* POC-2: 兜底机制,任何路径回 WAIT_WAKE 都切回 WAKE 模式(带 WakeNet) */
-    if (prev != APP_STATE_WAIT_WAKE) {
-        if (wake_word_set_mode(WAKE_WORD_MODE_WAKE) == ESP_OK) {
-            ESP_LOGI(TAG, "AFE mode -> WAKE (WakeNet enabled for wake word detection)");
-        }
-    }
     /* 停止静音定时器（若由定时器回调触发则跳过 stop） */
     if (!from_timer) {
         stop_silence_timer();
@@ -247,6 +241,13 @@ esp_err_t app_state_back_to_wait_wake(bool from_timer)
     esp_err_t err = audio_in_stop(ai);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "audio_in_stop failed: %s", esp_err_to_name(err));
+        return err; /* 上传任务仍持有当前采样位置，不能先切模式清空它的 FIFO。 */
+    }
+    /* 停上传后再切 AFE，保持缓存清空与采样计数复位的生命周期一致。 */
+    if (prev != APP_STATE_WAIT_WAKE) {
+        if (wake_word_set_mode(WAKE_WORD_MODE_WAKE) == ESP_OK) {
+            ESP_LOGI(TAG, "AFE mode -> WAKE (WakeNet enabled for wake word detection)");
+        }
     }
 
     app_state_set(APP_STATE_WAIT_WAKE);

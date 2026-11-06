@@ -29,6 +29,7 @@
 #include <stdatomic.h>
 #include "barge_in_guard.h"
 #include "audio_preroll_policy.h"
+#include "input_handoff.h"
 #include "esp_timer.h"
 
 static const char *TAG = "wake_word";
@@ -85,6 +86,10 @@ static atomic_bool s_barge_reset_requested = false;
 static bool s_preroll_protected = false;
 static uint32_t s_preroll_id = 0;
 static size_t s_preroll_dropped_samples = 0;
+static wake_word_audio_progress_t s_audio_progress; /* 同样由缓存锁保护 */
+static input_handoff_speech_t s_handoff_speech;
+static uint32_t s_handoff_id, s_handoff_next_id; /* 缓存锁保护，next 不随清空归零 */
+static int32_t afe_frame_energy(const int16_t *pcm, int samples);
 
 static size_t audio_buffer_frames_locked(void)
 {
@@ -98,6 +103,7 @@ static bool discard_oldest_audio_locked(void)
     size_t bytes;
     void *old = xRingbufferReceive(s_ringbuf, &bytes, 0);
     if (!old) return false;
+    s_audio_progress.read_end += bytes / sizeof(int16_t);
     vRingbufferReturnItem(s_ringbuf, old);
     return true;
 }
@@ -108,6 +114,72 @@ static void clear_audio_buffer_locked(void)
     while (discard_oldest_audio_locked()) {}
     s_preroll_protected = false;
     s_preroll_dropped_samples = 0;
+    memset(&s_audio_progress, 0, sizeof(s_audio_progress));
+    s_handoff_id = 0;
+    input_handoff_speech_reset(&s_handoff_speech);
+}
+
+uint32_t wake_word_watch_input_handoff(void)
+{
+    if (!s_audio_buffer_lock) return 0;
+    xSemaphoreTake(s_audio_buffer_lock, portMAX_DELAY);
+    if (++s_handoff_next_id == 0) ++s_handoff_next_id;
+    uint32_t id = s_handoff_id = s_handoff_next_id;
+    input_handoff_speech_reset(&s_handoff_speech);
+    xSemaphoreGive(s_audio_buffer_lock);
+    return id;
+}
+
+void wake_word_end_input_handoff(uint32_t id)
+{
+    if (!s_audio_buffer_lock) return;
+    xSemaphoreTake(s_audio_buffer_lock, portMAX_DELAY);
+    if (id == s_handoff_id) {
+        s_handoff_id = 0;
+        input_handoff_speech_reset(&s_handoff_speech);
+    }
+    xSemaphoreGive(s_audio_buffer_lock);
+}
+
+bool wake_word_get_input_handoff(uint32_t id, bool *pending, bool *confirmed)
+{
+    *pending = *confirmed = false;
+    if (!s_audio_buffer_lock || !id) return false;
+    xSemaphoreTake(s_audio_buffer_lock, portMAX_DELAY);
+    bool valid = id == s_handoff_id;
+    if (valid) {
+        *pending = s_handoff_speech.guard.samples != 0;
+        *confirmed = s_handoff_speech.confirmed;
+    }
+    xSemaphoreGive(s_audio_buffer_lock);
+    return valid;
+}
+
+void wake_word_get_audio_progress(wake_word_audio_progress_t *progress)
+{
+    if (!progress) return;
+    memset(progress, 0, sizeof(*progress));
+    if (!s_audio_buffer_lock) return;
+    xSemaphoreTake(s_audio_buffer_lock, portMAX_DELAY);
+    *progress = s_audio_progress;
+    xSemaphoreGive(s_audio_buffer_lock);
+}
+
+size_t wake_word_read_audio(int16_t *pcm, size_t capacity, uint32_t *sample_end)
+{
+    if (!s_ringbuf || !pcm || !sample_end) return 0;
+    xSemaphoreTake(s_audio_buffer_lock, portMAX_DELAY);
+    size_t bytes = 0;
+    void *item = xRingbufferReceive(s_ringbuf, &bytes, 0);
+    if (item) {
+        s_audio_progress.read_end += bytes / sizeof(int16_t);
+        *sample_end = s_audio_progress.read_end;
+        if (bytes <= capacity) memcpy(pcm, item, bytes);
+        /* 超容量返回实际长度，让消费者显式报错，不能把异常帧当作队列空。 */
+        vRingbufferReturnItem(s_ringbuf, item);
+    }
+    xSemaphoreGive(s_audio_buffer_lock);
+    return bytes;
 }
 
 /* 只在检测任务调用。当前 AFE 每项固定为一个 fetch 帧，队列项数就是 PCM 帧数。
@@ -148,7 +220,8 @@ static uint32_t buffer_afe_audio(const afe_fetch_result_t *res, bool confirm_bar
     /* 正常监听超载时保留较新的音频；保护期间缓存满时丢新帧并报告，绝不静默删句首。
      * 现有约 10 秒容量覆盖 1.5 秒预录音 + 最长 8 秒取消等待，无需再分配大缓存。
      */
-    while (xRingbufferSend(s_ringbuf, res->data, frame_bytes, 0) != pdTRUE) {
+    bool stored = false;
+    while (!(stored = xRingbufferSend(s_ringbuf, res->data, frame_bytes, 0) == pdTRUE)) {
         if (s_preroll_protected) {
             if (s_preroll_dropped_samples == 0) {
                 ESP_LOGW(TAG, "Barge-in buffer full: preserving prefix, dropping new audio (id=%lu)",
@@ -158,6 +231,16 @@ static uint32_t buffer_afe_audio(const afe_fetch_result_t *res, bool confirm_bar
             break;
         }
         if (!discard_oldest_audio_locked()) break;
+    }
+    if (stored) {
+        s_audio_progress.written_end += s_fetch_chunksize;
+        const int32_t energy = afe_frame_energy(res->data, s_fetch_chunksize);
+        if (res->vad_state == VAD_SPEECH &&
+            energy >= BARGE_IN_DIAGNOSTIC_ENERGY)
+            s_audio_progress.speech_end = s_audio_progress.written_end;
+        if (s_handoff_id && current_state == APP_STATE_LISTENING)
+            input_handoff_speech_feed(&s_handoff_speech,
+                res->vad_state == VAD_SPEECH, energy, s_fetch_chunksize);
     }
     if (protected_id) protected_frames = audio_buffer_frames_locked();
     xSemaphoreGive(s_audio_buffer_lock);
@@ -309,13 +392,18 @@ static void detect_Task(void *arg)
         /* 仅确认后请求取消。短暂弱音保留候选进度，但不计入有效人声时长；
          * 未确认前不静音、不暂停、不丢弃播放数据。
          */
-        if (audio_out_is_streaming() && app_state_get() == APP_STATE_PLAYING) {
-            if (!s_playback_seen) {
+        if (app_state_get() == APP_STATE_PLAYING) {
+            const bool playing = audio_out_is_streaming();
+            if (!playing) s_playback_seen = false;
+            if (playing && !s_playback_seen) {
                 s_playback_seen = true;
                 s_playback_started_ms = esp_log_timestamp();
             }
             const uint32_t now = esp_log_timestamp();
-            const uint32_t playback_age = now - (uint32_t)s_playback_started_ms;
+            /* 等待首包时没有扬声器回声，不必等到起播后才允许用户继续讲话。
+             * 真正开始播放后仍保留原有 1.2 秒回声保护和 480 ms 人声确认。 */
+            const uint32_t playback_age = barge_in_guard_age(playing,
+                now - (uint32_t)s_playback_started_ms);
             const int samples = res->data && res->data_size > 0
                                 ? res->data_size / sizeof(int16_t) : 0;
             const int32_t processed_energy = afe_frame_energy(res->data, samples);

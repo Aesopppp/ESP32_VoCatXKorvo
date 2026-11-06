@@ -223,15 +223,30 @@ esp_err_t provisioning_service_init(event_bus_t bus)
     return esp_timer_create(&args, &s_timeout_timer);
 }
 
+bool provisioning_service_get_info(char *ssid, size_t ssid_size, char *url, size_t url_size)
+{
+    if (!ssid || ssid_size < 33 || !url || url_size < 32) return false;
+    ssid[0] = url[0] = '\0';
+    if (!provisioning_service_is_active()) return false;
+    wifi_config_t config = {0};
+    esp_netif_ip_info_t ip;
+    esp_netif_t *ap = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+    if (!ap || esp_wifi_get_config(WIFI_IF_AP, &config) != ESP_OK ||
+        esp_netif_get_ip_info(ap, &ip) != ESP_OK) return false;
+    memcpy(ssid, config.ap.ssid, 32); ssid[32] = '\0';
+    snprintf(url, url_size, "http://" IPSTR, IP2STR(&ip.ip));
+    return true;
+}
+
 esp_err_t provisioning_service_start(void)
 {
     if (atomic_load(&s_active)) return ESP_OK;
     esp_err_t err = wifi_service_disconnect();
     if (err != ESP_OK) return err;
-    wifi_config_t ap = {.ap = {.channel = 1, .max_connection = 2, .authmode = WIFI_AUTH_WPA2_PSK}};
+    /* 开发阶段使用开放配网热点；结构体初始化同时将热点密码清空。 */
+    wifi_config_t ap = {.ap = {.channel = 1, .max_connection = 2, .authmode = WIFI_AUTH_OPEN}};
     snprintf((char *)ap.ap.ssid, sizeof(ap.ap.ssid), "YMOS-%02X%02X",
              (unsigned char)esp_random(), (unsigned char)esp_random());
-    strcpy((char *)ap.ap.password, "ymos1234");
     ap.ap.ssid_len = strlen((char *)ap.ap.ssid);
     err = esp_wifi_set_mode(WIFI_MODE_APSTA);  /* STA 仅用于扫描，不自动连接旧路由器。 */
     if (err == ESP_OK) err = esp_wifi_set_config(WIFI_IF_AP, &ap);
@@ -268,7 +283,7 @@ esp_err_t provisioning_service_start(void)
     s_deadline_us = esp_timer_get_time() + 600000000;
     err = esp_timer_start_once(s_timeout_timer, 600000000);
     if (err != ESP_OK) goto fail;
-    ESP_LOGI(TAG, "SoftAP provisioning: SSID=%s, open http://192.168.4.1/", ap.ap.ssid);
+    ESP_LOGI(TAG, "SoftAP provisioning: SSID=%s, auth=open (no password), open http://192.168.4.1/", ap.ap.ssid);
     return ESP_OK;
 fail:
     provisioning_service_stop();

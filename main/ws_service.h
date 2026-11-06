@@ -97,6 +97,13 @@ bool ws_service_reminder_timed_out(void);
 esp_err_t ws_service_send_json(const char *json_str);
 
 ws_conn_state_t ws_service_get_state(void);
+typedef struct {
+    uint32_t generation;
+    uint32_t turn;
+} ws_reply_offer_t;
+/** 主任务轮询待交接回答。身份按连接代次和本地回合校验，迟到批准不影响新回合。 */
+bool ws_service_get_reply_offer(ws_reply_offer_t *offer);
+bool ws_service_accept_reply(const ws_reply_offer_t *offer);
 esp_websocket_client_handle_t ws_service_get_client(void);
 
 #ifdef __cplusplus

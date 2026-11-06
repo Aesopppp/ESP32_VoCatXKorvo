@@ -10,6 +10,8 @@
 static const char *TAG = "board_service";
 static i2c_master_bus_handle_t s_audio_bus;
 
+i2c_master_bus_handle_t board_service_get_i2c_bus(void) { return s_audio_bus; }
+
 esp_err_t board_service_init(void)
 {
     if (s_audio_bus) return ESP_OK;

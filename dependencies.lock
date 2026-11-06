@@ -19,6 +19,16 @@ dependencies:
       registry_url: https://components.espressif.com
       type: service
     version: 1.7.19~2
+  espressif/cmake_utilities:
+    component_hash: 351350613ceafba240b761b4ea991e0f231ac7a9f59a9ee901f751bddc0bb18f
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.1'
+    source:
+      registry_url: https://components.espressif.com
+      type: service
+    version: 0.5.3
   espressif/dl_fft:
     component_hash: 965be7152132b365061abf5fc5fc7b85e525f73b94a204cdda61cfe9572c0d77
     dependencies:
@@ -44,7 +54,7 @@ dependencies:
       require: private
       version: '*'
     source:
-      registry_url: https://components.espressif.com
+      registry_url: https://components.espressif.com/
       type: service
     targets:
     - esp32
@@ -95,6 +105,20 @@ dependencies:
       registry_url: https://components.espressif.com/
       type: service
     version: 1.6.2
+  espressif/esp_lcd_st77916:
+    component_hash: c0a565af3ea85a9d9f1e79b0e4d0829378db319bc4dab4939eca44361b3c5a1b
+    dependencies:
+    - name: espressif/cmake_utilities
+      registry_url: https://components.espressif.com
+      require: private
+      version: 0.*
+    - name: idf
+      require: private
+      version: '>=5.4'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 2.0.2
   espressif/esp_new_jpeg:
     component_hash: e1e7e6991193c41ed6c9fc386702aa7821433319e7aa9c3147cd3236310cd69c
     dependencies: []
@@ -128,12 +152,22 @@ dependencies:
     source:
       type: idf
     version: 6.1.0
+  lvgl/lvgl:
+    component_hash: 184e532558c1c45fefed631f3e235423d22582aafb4630f3e8885c35281a49ae
+    dependencies: []
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 9.5.0
 direct_dependencies:
 - esphome/micro-opus
+- espressif/esp-dl
 - espressif/esp-sr
 - espressif/esp_codec_dev
+- espressif/esp_lcd_st77916
 - espressif/esp_websocket_client
 - idf
-manifest_hash: c1ec34efdbb338b3d8151d560545528a6e560bca7551202c2f25732cf7f20166
+- lvgl/lvgl
+manifest_hash: 49f1230056165a4b19b325a8ddcc0b626b87dec2b055fa1c85d60d653c810ae1
 target: esp32s3
 version: 3.0.0

@@ -73,6 +73,8 @@ esp_err_t wifi_service_disconnect(void);
  * @brief 获取当前 Wi-Fi 状态
  */
 wifi_state_t wifi_service_get_state(void);
+/* 当前已关联 AP 的 SSID，失败清空输出；不返回历史保存的网络名称。 */
+bool wifi_service_get_ssid(char *buf, size_t buf_size);
 
 /**
  * @brief 获取本地 IP 地址字符串（IPv4）

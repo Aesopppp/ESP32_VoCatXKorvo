@@ -1,6 +1,8 @@
 /* 运行生产 JSON 解析和回复流策略，重放工具调用、多段音频与取消的事件顺序。
  * 主机命令见 docs/acos-response-lifecycle.md；不模拟 DMA/RTOS/平台服务。 */
 #include "../main/response_stream.h"
+#include "../main/input_handoff.h"
+#include "../main/barge_in_guard.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -245,6 +247,62 @@ static void failure_checks(void)
     }
 }
 
+static void input_handoff_checks(void)
+{
+    response_stream_t stream;
+    response_stream_begin(&stream, 3);
+    response_stream_hold_input(&stream);
+    /* 用户日志：1792 ms 待补传，18 个 20 ms 包后平台就提前结束输入。
+     * 快速下行不能抢在主任务处理前播放；历史积压只能补传，不能直接取消。 */
+    CHECK(input_handoff_decide(true, true, 16000, 18 * 320, false, false) == INPUT_HANDOFF_DRAIN);
+    CHECK(response_stream_input_held(&stream, 3));
+    CHECK(!response_stream_accept_audio(&stream, 3));
+    CHECK(!response_stream_release_input(&stream, 2)); /* 迟到批准 */
+    control(&stream, "{\"type\":\"response.audio.done\"}");
+    CHECK(!response_stream_finish_if_drained(&stream, true, true, true));
+    CHECK(input_handoff_decide(true, true, 16000, 18 * 320, true, true) == INPUT_HANDOFF_CANCEL);
+    CHECK(response_stream_begin_cancel(&stream));
+    CHECK(!response_stream_input_held(&stream, 3)); /* worker 能继续处理取消边界 */
+    CHECK(!response_stream_accept_audio(&stream, 3));
+    CHECK(control(&stream, "{\"type\":\"response.cancelled\"}") == RESPONSE_STREAM_CANCELLED);
+    CHECK(!response_stream_release_input(&stream, 3));
+
+    response_stream_begin(&stream, 4);
+    response_stream_hold_input(&stream);
+    /* 已上传全部人声，只差预录音中的静音尾部：等待补完，不取消有效回答。 */
+    CHECK(input_handoff_decide(true, true, 16000, 17000, false, false) == INPUT_HANDOFF_DRAIN);
+    CHECK(!response_stream_accept_audio(&stream, 4));
+    CHECK(input_handoff_decide(true, false, 16000, 28800, false, false) == INPUT_HANDOFF_ACCEPT);
+    CHECK(response_stream_release_input(&stream, 4));
+    CHECK(response_stream_accept_audio(&stream, 4));
+    CHECK(!response_stream_accept_audio(&stream, 3));
+    control(&stream, "{\"type\":\"response.audio.done\"}");
+    CHECK(response_stream_finish_if_drained(&stream, true, true, true));
+
+    /* 等交接时新的断句覆盖旧 offer，旧批准/旧音频不准穿过。 */
+    response_stream_begin(&stream, 5);
+    response_stream_hold_input(&stream);
+    response_stream_begin(&stream, 6);
+    response_stream_hold_input(&stream);
+    CHECK(!response_stream_release_input(&stream, 5));
+    CHECK(!response_stream_accept_audio(&stream, 5));
+    CHECK(response_stream_input_held(&stream, 6));
+    response_stream_reset(&stream);
+    CHECK(!response_stream_release_input(&stream, 6));
+
+    CHECK(input_handoff_decide(false, true, 16000, 0, false, false) == INPUT_HANDOFF_ACCEPT);
+    CHECK(input_handoff_decide(true, false, 320, UINT32_MAX - 319, false, false) == INPUT_HANDOFF_DRAIN);
+    CHECK(input_handoff_decide(true, false, UINT32_MAX - 319, 320, false, false) == INPUT_HANDOFF_ACCEPT);
+    barge_in_guard_t guard = {0};
+    for (unsigned i = 0; i < 14; ++i)
+        CHECK(barge_in_guard_feed(&guard, true, 20000, 512,
+              barge_in_guard_age(false, 0)) != BARGE_IN_CONFIRMED);
+    CHECK(barge_in_guard_feed(&guard, true, 20000, 512,
+          barge_in_guard_age(false, 0)) == BARGE_IN_CONFIRMED); /* 不必等喇叭出声 */
+    CHECK(barge_in_guard_feed(&guard, true, 20000, 512,
+          barge_in_guard_age(true, 0)) == BARGE_IN_WAIT_STARTUP); /* 起播保护仍有效 */
+}
+
 int main(void)
 {
     parser_checks();
@@ -253,6 +311,7 @@ int main(void)
     tool_audio_fallback_checks();
     cancellation_checks();
     failure_checks();
+    input_handoff_checks();
     printf("PASS: %u response stream checks (production JSON parser and lifecycle)\n", checks);
     return 0;
 }

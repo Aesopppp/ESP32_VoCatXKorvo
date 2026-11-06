@@ -1,4 +1,4 @@
-# YMOS → ESP-VoCat v1.2 无屏移植
+# YMOS → ESP-VoCat v1.2 移植
 
 ## 版本与范围
 
@@ -11,7 +11,7 @@
 
 本版保留 YMOS 的 C 服务结构、事件总线、WebSocket 鉴权与语音协议、连续对话、打断、句首预录音、NVS 和本地网页配网。按最新要求，**不启动 MQTT、不接入远程定时提醒**，也未合入另一个 YMOS 工作目录中新加的设备 HTTP 握手。
 
-不初始化屏幕、触摸、动画、SD 卡、IMU 或电量计。屏幕背光关闭，没有图标和菜单。`led_service` 只保留逻辑状态接口；串口日志是本版观察状态的方式。旧 Korvo 的红/绿灯和 ADC 按键不适用于此板。
+后续增加了 ST77916 屏幕、CST816S 触摸和设置菜单，详见 [屏幕与触屏](vocat-screen-menu.md)。未初始化完整动画资源、SD 卡、IMU 或电量计。`led_service` 只保留逻辑状态接口；屏幕和串口用于观察状态。旧 Korvo 的红/绿灯和 ADC 按键不适用于此板。
 
 ## 引脚与硬件初始化
 
@@ -25,7 +25,7 @@
 | I2S0 MCLK / BCLK / WS | GPIO42 / GPIO40 / GPIO39 |
 | I2S0 DOUT / DIN | GPIO41 / GPIO3 |
 | BOOT | GPIO0，低电平按下 |
-| LCD 背光 | GPIO44，保持低电平 |
+| LCD 背光 | GPIO44，启动保持低电平，画面就绪后由 LEDC PWM 接管 |
 | 日志控制台 | 原生 USB Serial/JTAG，避免 UART0 占用 GPIO43/44 |
 
 `board_service_init()` 负责供电和 I2C 总线；上电稳定后有界重试探测两颗 Codec。`audio_out` 借用这条总线，不负责删除它。该初始化固定面向 **v1.2**，不自动探测并兼容其他 PCB 版本。
@@ -53,7 +53,7 @@ ACOS WebSocket → Opus 解码 → YMOS PCM 队列 → codec_dev → ES8311 → 
 
 1. 正常上电，等待日志 `BOOT ready` 和 `Wi-Fi ready`。首次无可用 Wi-Fi 时自动进入配网。
 2. 需要重新配网时，运行中按住 **BOOT 约 3 秒**。每次按住只发送一次配网事件，短按没有功能；配网期间再次长按也不会退出。
-3. 手机连接 `YMOS-XXXX` 热点，密码 **`ymos1234`**。热点后缀沿用原程序，每次启动配网可能不同。
+3. 手机连接 `YMOS-XXXX` 开放热点，**无需输入热点密码**。热点后缀沿用原程序，每次启动配网可能不同。
 4. 若系统未自动弹出页面，在浏览器打开 **http://192.168.4.1/**。扫描并选择家中 Wi-Fi、填写密码、提交。页面由设备本地提供。
 5. 提交后尝试连接；连接失败按原逻辑回滚并重新配网。无操作配网窗口为 10 分钟；到期尝试恢复已保存网络。
 6. 正常联网后说 **“你好小智”** 唤醒（模型 `wn9s_nihaoxiaozhi`），再开始提问。此备份基线在唤醒时建立 WebSocket；进入待机则断开。不是 XChatbot 的待机常连策略。
@@ -78,7 +78,7 @@ ACOS WebSocket → Opus 解码 → YMOS PCM 队列 → codec_dev → ES8311 → 
 
 为便于后续与 YMOS 对比，原 `mqtt_service.*`、`mqtt_topics.*`、`acos_reminder_service.*`、`reminder_message.*` 和 `tca9554.*` 源码仍留作参考，但不列入本版编译清单。依赖清单移除了 MQTT。WebSocket 内保留基线的提醒兼容接口，目前无应用入口调用；它不会自行订阅或请求提醒。历史 MQTT 文档不代表本固件已启用这些功能。
 
-下一阶段接触屏时，通过事件总线进入配网/音量/对话业务，不在触摸回调里直接停止音频、操作网络或写 NVS。首先独立实现显示/触摸服务，再由主任务转发状态，避免把 LVGL 混入实时音频路径。
+触屏通过事件总线进入配网/音量/对话业务，不在触摸回调里直接停止音频、操作网络或写 NVS。显示/触摸服务独立，由主任务转发显示快照，LVGL 不进入实时音频路径。模块和验收步骤见 [屏幕与触屏](vocat-screen-menu.md)。
 
 ## 构建与验证边界
 
@@ -93,7 +93,7 @@ idf.py build
 
 VS Code 可以直接打开该目录或 `VoCat.code-workspace`，使用 ESP-IDF 扩展的编译按钮。本机 `.vscode/settings.json` 指向已安装的 6.1 工具链，未固定 COM 口；烧录前选择实际 VoCat 端口。
 
-最终产物为 `build/vocat_korvo_agent.bin`，同目录包含 bootloader、分区表、OTA 初始数据和唤醒模型等产物。`sdkconfig.defaults` 从本次实际配置导出。依赖保持 YMOS 基线版本，仅移除 MQTT。
+最终产物为 `build/vocat_korvo_agent.bin`，同目录包含 bootloader、分区表、OTA 初始数据和唤醒模型等产物。`sdkconfig.defaults` 保存工程默认配置。音频依赖保持 YMOS 基线版本，移除 MQTT 后新增 LVGL 和 ST77916 显示依赖。
 
 之后自行烧录时，在上述工程目录、IDF 6.1 终端中，使用实际确认的 VoCat COM 端口执行 `idf.py -p COM端口 flash monitor`。本次未执行此命令。
 
@@ -125,3 +125,46 @@ VS Code 可以直接打开该目录或 `VoCat.code-workspace`，使用 ESP-IDF �
 重新烧录后，第一次启动应出现 `Local ACOS preset applied once`。联网后说“你好小智”，鉴权成功应出现 `WebSocket authenticated; audio upload ready`，随后进入监听。前者只表示配置已保存；后者才表示平台鉴权通过。
 
 主机模拟覆盖生产预设函数的旧/空凭据迁移、后续用户配置保留，以及六个 NVS 读写/提交失败与重试场景；这不等同于实板断电测试。验证资料位于 `work/acos-connection/`。
+
+## WSS 重连内存修复（2026-11-06）
+
+实板日志显示第一次 WSS 连接与平台鉴权成功；监听时触屏结束对话后，再次唤醒出现
+`mbedtls_ssl_setup returned -0x008D`，随后每 5 秒重试均失败。在本项目使用的
+ESP-IDF 6.1 中，`MBEDTLS_ERR_SSL_ALLOC_FAILED` 对应 `PSA_ERROR_INSUFFICIENT_MEMORY`
+（-141，即 -0x008D），表示本地 TLS 分配失败，尚未进入本轮平台鉴权。
+
+设备端调整：
+
+- 在 `sdkconfig` 和 `sdkconfig.defaults` 同时选择 `CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y`，
+  使用 SDK 自带的 PSRAM 分配器。原配置仅允许 TLS 使用内部 RAM；新的分配策略让 TLS
+  动态内存使用外部 RAM，为音频、Wi-Fi、LCD DMA 和任务栈保留内部内存余量。
+- 使用现有 ESP-IDF 配置入口，不修改 `managed_components` 或 SDK，也不自建 TLS 分配器。
+  LCD DMA 和任务栈仍按原有要求分配。证书验证、平台 URL/密钥、鉴权及音频协议没有更改。
+- WebSocket 连接前、连接成功、传输错误、停止后记录内存快照，分别包括内部 RAM 和
+  PSRAM 的空闲总量、最大连续块、开机以来最低空闲量。仅在连接阶段记录，不逐音频帧打印。
+- 修正错误日志读取：WebSocket 组件 1.8 在非 TCP 错误事件中未初始化 TLS/errno 字段，
+  设备只在错误类型明确为 TCP transport 时读取这些字段，并在断开事件中补充诊断。
+  不输出请求正文、错误文本中的请求头或凭据。
+
+已检查现有关闭路径：`esp_websocket_client_stop()` 等待网络任务结束，网络任务关闭 transport，
+TLS 连接及上下文由 SDK 释放；下一次 start 会销毁并重新创建 transport 列表。
+未根据猜测增加强制释放或重复 destroy。此次改动解决已知的 TLS 内存分配归属限制；
+是否仍有其他资源泄漏或碎片，需要连续启停的实板数据确认。
+
+重新编译烧录后，应能看到：
+
+```text
+TLS allocator: PSRAM (SDK); certificate verification enabled
+Connection heap [before-tls]: internal free=... largest=... min=...; PSRAM free=... largest=... min=...
+Connection heap [connected]: ...
+WebSocket authenticated; audio upload ready
+Connection heap [after-stop]: ...
+```
+
+同一冷启动中连续进行至少 10 次“唤醒 → 鉴权成功 → 监听时触屏结束 → 再次唤醒”，
+再测试普通问答、语音打断和断网恢复。保留完整启动段和上述快照。
+若仍分配失败，对照 `transport-error` 与下一次 `before-tls`，区分总量不足、连续块不足和
+多轮下降。FreeRTOS 任务栈由空闲任务最终回收，因此不能只用紧邻停止时的单次快照判断泄漏。
+
+本地备份、回归日志与构建记录位于 `work/tls-memory-20261106/`（不提交源码仓库）。
+编译和主机逻辑回归不能证明实板上的连续重连、PSRAM 带宽或音频听感；本轮未烧录。

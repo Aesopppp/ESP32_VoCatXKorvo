@@ -15,6 +15,7 @@
 #include "freertos/idf_additions.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
+#include "sdkconfig.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdatomic.h>
@@ -65,6 +66,38 @@ static bool current(const rx_frame_t *packet)
 {
     return packet->generation == atomic_load(&generation) &&
            (state == WS_STATE_CONNECTED || state == WS_STATE_AUTHING);
+}
+
+/* 仅在连接生命周期边界采样，不逐音频帧扫描堆。按内存能力分别记录最大
+ * 连续块与总量，避免把“PSRAM 充足”误当成“内部 RAM 足够建立 TLS”。
+ * minimum_free_bytes 是开机以来的低水位；不同阶段快照用于实板判断泄漏/碎片。 */
+static void log_connection_memory(const char *phase)
+{
+    multi_heap_info_t internal, external;
+    heap_caps_get_info(&internal, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    heap_caps_get_info(&external, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    ESP_LOGI(TAG, "Connection heap [%s]: internal free=%u largest=%u min=%u; PSRAM free=%u largest=%u min=%u",
+             phase, (unsigned)internal.total_free_bytes, (unsigned)internal.largest_free_block,
+             (unsigned)internal.minimum_free_bytes, (unsigned)external.total_free_bytes,
+             (unsigned)external.largest_free_block, (unsigned)external.minimum_free_bytes);
+}
+
+static void log_transport_error(const char *phase, const esp_websocket_event_data_t *event)
+{
+    if (!event) return;
+    const esp_websocket_error_codes_t *error = &event->error_handle;
+    /* 组件 1.8 的 ERROR 可能先于设置 TCP 错误类型；非 TCP 事件的 TLS/errno
+     * 字段未初始化，禁止读取。随后 DISCONNECTED 才可能携带有效传输详情。
+     * 不输出 data_ptr，避免组件错误文本带出请求头或凭据。 */
+    if (error->error_type == WEBSOCKET_ERROR_TYPE_TCP_TRANSPORT) {
+        ESP_LOGW(TAG, "Transport detail [%s]: socket=%d tls=0x%x stack=%d verify=0x%x http=%d",
+                 phase, error->esp_transport_sock_errno, error->esp_tls_last_esp_err,
+                 error->esp_tls_stack_err, error->esp_tls_cert_verify_flags,
+                 error->esp_ws_handshake_status_code);
+    } else if (error->error_type != WEBSOCKET_ERROR_TYPE_NONE) {
+        ESP_LOGW(TAG, "Transport detail [%s]: type=%d close=%d",
+                 phase, error->error_type, event->close_status_code);
+    }
 }
 
 static void log_server_error(const proto_msg_t *msg)
@@ -226,6 +259,7 @@ static void handle_frame(const rx_frame_t *packet)
         if (atomic_load(&reminder_mode)) break;
         if (reply.phase == RESPONSE_CANCELLING) break;
         response_stream_begin(&reply, packet->turn);
+        response_stream_hold_input(&reply);
         played_frames = discarded_frames = 0;
         publish(EV_WS_SPEECH_STOPPED, packet->generation);
         break;
@@ -247,6 +281,7 @@ static void handle_frame(const rx_frame_t *packet)
             publish(EV_WS_SERVER_ERROR, packet->generation);
         } else if (action == RESPONSE_STREAM_CONTINUED) {
             /* 仅明确的新 response.created 能恢复已排空回合；迟到二进制不能。 */
+            response_stream_hold_input(&reply);
             publish(EV_WS_RESPONSE_CONTINUED, packet->generation);
         }
         break;
@@ -292,9 +327,27 @@ static void receive_task(void *arg)
 {
     (void)arg;
     rx_frame_t packet;
+    bool held = false;
     while (true) {
-        if (xQueueReceive(rx_queue, &packet, pdMS_TO_TICKS(10)) == pdTRUE) {
-            handle_frame(&packet);
+        if (held || xQueueReceive(rx_queue, &packet, pdMS_TO_TICKS(10)) == pdTRUE) {
+            bool wait_input = false, superseded = false;
+            xSemaphoreTake(playback_lock, portMAX_DELAY);
+            if (current(&packet) && packet.opcode == 2 &&
+                response_stream_input_held(&reply, packet.turn)) {
+                superseded = packet.turn != atomic_load(&wire_turn);
+                wait_input = !superseded;
+            }
+            xSemaphoreGive(playback_lock);
+            if (wait_input) {
+                /* 只暂持当前一包，其他包仍在原有有界 RX 队列；不持锁等待主任务。
+                 * 取消会解除 hold 并丢弃旧音频；新 speech_stopped 已到达时也必须
+                 * 跳过旧包，让 worker 处理后面的新回合，不能被旧回答堵住。 */
+                held = true;
+                vTaskDelay(pdMS_TO_TICKS(10));
+                continue;
+            }
+            held = false;
+            if (!superseded) handle_frame(&packet);
             release_rx_frame(packet.data, packet.len);
         }
         finish_playback_if_drained();
@@ -309,21 +362,22 @@ static void on_ws(void *arg, esp_event_base_t base, int32_t id, void *event)
 {
     (void)arg; (void)base;
     uint32_t gen = atomic_load(&generation);
-    if (id == WEBSOCKET_EVENT_CONNECTED) {
+    if (id == WEBSOCKET_EVENT_BEFORE_CONNECT) {
+        /* 已创建网络任务/transport，尚未分配本轮 TLS 握手内存。 */
+        log_connection_memory("before-tls");
+    } else if (id == WEBSOCKET_EVENT_CONNECTED) {
         state = WS_STATE_AUTHING;
+        log_connection_memory("connected");
         publish(EV_WS_CONNECTED, gen);
     } else if (id == WEBSOCKET_EVENT_DISCONNECTED || id == WEBSOCKET_EVENT_CLOSED) {
         state = WS_STATE_DISCONNECTED;
+        log_transport_error("disconnected", event);
         release_rx_frame(frame, frame_size); frame = NULL; frame_size = received = 0;
         publish(EV_WS_DISCONNECTED, gen);
     } else if (id == WEBSOCKET_EVENT_ERROR) {
         state = WS_STATE_ERROR;
-        esp_websocket_event_data_t *failure = event;
-        if (failure) ESP_LOGW(TAG, "Transport detail: type=%d socket=%d tls=0x%x stack=%d close=%d",
-                             failure->error_handle.error_type,
-                             failure->error_handle.esp_transport_sock_errno,
-                             failure->error_handle.esp_tls_last_esp_err,
-                             failure->error_handle.esp_tls_stack_err, failure->close_status_code);
+        log_transport_error("error", event);
+        log_connection_memory("transport-error");
         publish(EV_WS_ERROR, gen);
     } else if (id == WEBSOCKET_EVENT_DATA) {
         esp_websocket_event_data_t *data = event;
@@ -405,6 +459,11 @@ esp_err_t ws_service_init(void)
     if (!client) goto fail;
     if (esp_websocket_register_events(client, WEBSOCKET_EVENT_ANY, on_ws, NULL) != ESP_OK) goto fail;
     if (xTaskCreatePinnedToCore(receive_task, "ws_rx_audio", 8192, NULL, 4, &rx_task, 1) != pdPASS) goto fail;
+#if CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC
+    ESP_LOGI(TAG, "TLS allocator: PSRAM (SDK); certificate verification enabled");
+#else
+    ESP_LOGW(TAG, "TLS allocator is not PSRAM; check mbedTLS memory configuration for this board");
+#endif
     ESP_LOGI(TAG, "RX buffer: %u frames, %u KiB Opus budget in PSRAM; %u control slots reserved",
              WS_RX_FRAMES, WS_RX_AUDIO_BYTES / 1024u, WS_RX_CONTROL_RESERVE);
     return ESP_OK;
@@ -421,7 +480,10 @@ esp_err_t ws_service_connect(void)
     state = WS_STATE_CONNECTING;
     esp_err_t err = esp_websocket_client_start(client);
     if (err == ESP_OK) client_started = true;
-    else state = WS_STATE_ERROR;
+    else {
+        state = WS_STATE_ERROR;
+        log_connection_memory("start-failed");
+    }
     return err;
 }
 esp_err_t ws_service_authenticate(void)
@@ -437,6 +499,7 @@ esp_err_t ws_service_authenticate(void)
 esp_err_t ws_service_disconnect(void)
 {
     if (!client) return ESP_ERR_INVALID_STATE;
+    bool was_started = client_started;
     state = WS_STATE_DISCONNECTED;
     if (client_started) {
         esp_err_t err = esp_websocket_client_stop(client);
@@ -461,6 +524,9 @@ esp_err_t ws_service_disconnect(void)
     while (xQueueReceive(rx_queue, &packet, 0) == pdTRUE) release_rx_frame(packet.data, packet.len);
     release_rx_frame(frame, frame_size); frame = NULL; frame_size = received = 0;
     rx_drop_count = 0;
+    /* stop 已等待 transport 关闭；任务栈的最终回收由空闲任务完成，下一次
+     * before-tls 快照也要一起比较，不能单凭此处的差值就认定内存泄漏。 */
+    if (was_started) log_connection_memory("after-stop");
     return ESP_OK;
 }
 esp_err_t ws_service_deinit(void)
@@ -477,6 +543,32 @@ esp_err_t ws_service_deinit(void)
     return ESP_OK;
 }
 ws_conn_state_t ws_service_get_state(void) { return state; }
+bool ws_service_get_reply_offer(ws_reply_offer_t *offer)
+{
+    if (!playback_lock || !offer) return false;
+    /* 每轮主循环都会查询；播放忙时留到下一轮，不拖住按键/触屏和超时处理。 */
+    if (xSemaphoreTake(playback_lock, 0) != pdTRUE) return false;
+    bool pending = state == WS_STATE_CONNECTED &&
+        response_stream_input_held(&reply, atomic_load(&wire_turn));
+    if (pending) {
+        offer->generation = atomic_load(&generation);
+        offer->turn = reply.turn;
+    }
+    xSemaphoreGive(playback_lock);
+    return pending;
+}
+
+bool ws_service_accept_reply(const ws_reply_offer_t *offer)
+{
+    if (!playback_lock || !offer) return false;
+    xSemaphoreTake(playback_lock, portMAX_DELAY);
+    bool accepted = state == WS_STATE_CONNECTED &&
+        offer->generation == atomic_load(&generation) &&
+        offer->turn == atomic_load(&wire_turn) &&
+        response_stream_release_input(&reply, offer->turn);
+    xSemaphoreGive(playback_lock);
+    return accepted;
+}
 esp_websocket_client_handle_t ws_service_get_client(void) { return client; }
 esp_err_t ws_service_send_json(const char *text)
 {

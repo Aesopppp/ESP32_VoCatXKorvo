@@ -2,6 +2,13 @@ idf_component_register(
     SRCS
         "app_main.c"
         "board_service.c"
+        "display_service.c"
+        "touch_service.c"
+        "ui_service.c"
+        "ui_face.c"
+        "ui_animation.c"
+        "ui_face_assets.c"
+        "vocat_ui_font_20.c"
         "button_service.c"
         "app_state.c"
         "event_bus.c"
@@ -47,6 +54,12 @@ idf_component_register(
         esp_driver_i2s
         esp_driver_uart
         esp_ringbuf
+        esp_lcd
+        esp_partition
+        esp_lcd_st77916
+        lvgl
+        esp_driver_spi
+        esp_driver_ledc
 )
 
 # Suppress warnings from IDF headers in third-party code

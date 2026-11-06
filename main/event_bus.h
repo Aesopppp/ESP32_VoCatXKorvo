@@ -60,6 +60,12 @@ typedef enum {
     EV_BUTTON_TALK          = 62,
     EV_BUTTON_END_TALK      = 63,
     EV_BUTTON_PROVISION     = 64,
+    /* UI 只发布无 payload 的操作事件；主任务串行执行，与硬件按键共享业务入口。 */
+    EV_UI_TALK              = 65,
+    EV_UI_BRIGHTNESS_DOWN   = 66,
+    EV_UI_BRIGHTNESS_UP     = 67,
+    EV_UI_PROVISION         = 68,
+    EV_UI_PROVISION_EXIT    = 69,
 } app_event_id_t;
 
 #define EV_SYSTEM_WIFI_DISCONNECTED EV_WIFI_DISCONNECTED

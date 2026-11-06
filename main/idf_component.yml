@@ -1,5 +1,5 @@
 version: "1.0.0"
-description: "YMOS voice assistant port for ESP-VoCat v1.2 (headless)"
+description: "YMOS voice assistant for ESP-VoCat v1.2 with touchscreen settings"
 
 dependencies:
   # Core ESP-IDF
@@ -17,7 +17,17 @@ dependencies:
   espressif/esp-sr:
     version: ">=2.5.3"
 
+  # 保持本轮已验证的音频推理依赖，增加 UI 时不顺带升级。
+  espressif/esp-dl:
+    version: "3.3.13"
+
   # WebSocket 客户端（IDF 6.1 继续作为独立组件使用）
   # 注意：组件名是 esp_websocket_client（下划线），不是 esp-websocket-client（连字符）
   espressif/esp_websocket_client:
     version: "^1.8.0"
+
+  # 显示驱动和纯 C 图形库；版本固定以便复现与验证升级。
+  espressif/esp_lcd_st77916:
+    version: "2.0.2"
+  lvgl/lvgl:
+    version: "9.5.0"

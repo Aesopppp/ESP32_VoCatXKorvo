@@ -20,6 +20,24 @@ set(PROJECT_VER "1.0.0-vocat")
 
 project(vocat_korvo_agent)
 
+# 只打包四种基础 EAF 动画。独立数据分区，不挤占应用 OTA/唤醒模型空间。
+partition_table_get_partition_info(ui_assets_offset "--partition-name ui_assets" "offset")
+partition_table_get_partition_info(ui_assets_size "--partition-name ui_assets" "size")
+if(NOT ui_assets_offset OR NOT ui_assets_size)
+    message(FATAL_ERROR "Partition table must provide ui_assets for VoCat expressions")
+endif()
+set(ui_assets_source "${CMAKE_CURRENT_SOURCE_DIR}/assets/face")
+set(ui_assets_binary "${CMAKE_CURRENT_BINARY_DIR}/ui_assets.bin")
+add_custom_command(OUTPUT "${ui_assets_binary}"
+    COMMAND ${PYTHON} "${CMAKE_CURRENT_SOURCE_DIR}/scripts/generate_face_assets.py"
+        --source "${ui_assets_source}" --output "${ui_assets_binary}" --max-size "${ui_assets_size}"
+    DEPENDS scripts/generate_face_assets.py assets/face/manifest.json
+        assets/face/neutral.eaf assets/face/winking.eaf assets/face/confused.eaf assets/face/listen.eaf
+    VERBATIM)
+add_custom_target(ui_assets ALL DEPENDS "${ui_assets_binary}")
+esptool_py_flash_to_partition(flash "ui_assets" "${ui_assets_binary}")
+add_dependencies(flash ui_assets)
+
 # Xtensa GCC 14.2.0 ICEs in register allocation for this ESP-DSP 1.8.0
 # image-convolution fallback at -O2. Keep performance optimization elsewhere.
 if(CMAKE_C_COMPILER_ID STREQUAL "GNU" AND CMAKE_C_COMPILER_VERSION VERSION_EQUAL "14.2.0")

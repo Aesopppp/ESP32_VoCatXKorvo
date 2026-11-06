@@ -44,10 +44,14 @@
 #include "ws_service.h"
 #include "proto_service.h"
 #include "audio_in.h"
+#include "input_handoff.h"
 #include "wake_word.h"
 #include "provisioning_service.h"
 #include "button_service.h"
 #include "button_policy.h"
+#include "ui_service.h"
+#include "ui_policy.h"
+#include "display_service.h"
 
 static const char *TAG = "app_main";
 
@@ -57,6 +61,9 @@ static event_bus_t s_bus;
 static led_service_t s_led;
 static int s_saved_volume;
 static int64_t s_volume_save_at_ms;
+static int s_brightness, s_saved_brightness;
+static int64_t s_brightness_save_at_ms;
+static bool s_ui_ready;
 
 
 #define MAIN_TASK_PRIORITY   5
@@ -66,7 +73,7 @@ static int64_t s_volume_save_at_ms;
 
 static esp_err_t system_init(void)
 {
-    ESP_LOGI(TAG, "=== YMOS VoCat v1.2 starting (ESP-IDF v6.1, no display/MQTT) ===");
+    ESP_LOGI(TAG, "=== YMOS VoCat v1.2 starting (ESP-IDF v6.1, touchscreen, no MQTT) ===");
 
 #if CONFIG_SPIRAM
     if (esp_psram_get_size() > 0) {
@@ -108,6 +115,16 @@ static esp_err_t system_init(void)
         ESP_LOGW(TAG, "Buttons unavailable: %s", esp_err_to_name(button_err));
     }
 
+    /* 音频先取得所需资源；UI 失败降级为语音和 BOOT，不反复重启设备。 */
+    s_brightness = ui_brightness_restore(cfg_service_get_int(CFG_KEY_BRIGHTNESS, UI_BRIGHTNESS_DEFAULT));
+    s_saved_brightness = s_brightness;
+    esp_err_t ui_err = ui_service_init();
+    s_ui_ready = ui_err == ESP_OK;
+    if (s_ui_ready) {
+        ui_err = display_service_set_brightness(s_brightness);
+        if (ui_err != ESP_OK) ESP_LOGW(TAG, "Backlight failed: %s", esp_err_to_name(ui_err));
+    } else ESP_LOGW(TAG, "Display unavailable: %s; voice and BOOT remain active", esp_err_to_name(ui_err));
+
     return ESP_OK;
 }
 
@@ -120,11 +137,24 @@ static bool session_requested;
 static int64_t retry_at_ms, auth_deadline_ms, cancel_deadline_ms, response_deadline_ms;
 static int64_t resume_deadline_ms;
 static int64_t cancel_probe_ms;
+static struct {
+    ws_reply_offer_t offer;
+    uint32_t observer;
+    int64_t started_ms;
+    bool logged_wait;
+} input_handoff;
 
 static int64_t now_ms(void) { return esp_timer_get_time() / 1000; }
 
+static void reset_input_handoff(void)
+{
+    wake_word_end_input_handoff(input_handoff.observer);
+    memset(&input_handoff, 0, sizeof(input_handoff));
+}
+
 static void end_conversation(const char *reason)
 {
+    reset_input_handoff();
     session_requested = conversation_active = false;
     retry_at_ms = auth_deadline_ms = cancel_deadline_ms = response_deadline_ms = 0;
     resume_deadline_ms = cancel_probe_ms = 0;
@@ -145,6 +175,7 @@ static void end_conversation(const char *reason)
 static void recover_session(const char *reason)
 {
     if (!session_requested || provisioning_service_is_active()) return;
+    reset_input_handoff();
     ESP_LOGW(TAG, "Session recovery: %s", reason);
     if (conversation_active && !resume_deadline_ms) resume_deadline_ms = now_ms() + 60000;
     app_state_back_to_wait_wake(false);
@@ -162,6 +193,16 @@ static void recover_session(const char *reason)
 
 static void resume_listening(bool keep_buffered_speech, const char *reason)
 {
+    reset_input_handoff();
+    /* 切模式会清空 FIFO/采样位置，必须在启动上传任务之前完成，不能让新的
+     * sent_end 和被复位的 AFE 位置属于不同基准。 */
+    if (wake_word_get_mode() != WAKE_WORD_MODE_LITE) {
+        if (wake_word_set_mode(WAKE_WORD_MODE_LITE) != ESP_OK) {
+            recover_session("could not select listening AFE");
+            return;
+        }
+        ESP_LOGI(TAG, "AFE mode -> LITE (WakeNet disabled for audio)");
+    }
     if (!keep_buffered_speech) wake_word_clear_audio_buffer();
     cancel_deadline_ms = response_deadline_ms = 0;
     cancel_probe_ms = 0;
@@ -171,18 +212,12 @@ static void resume_listening(bool keep_buffered_speech, const char *reason)
     }
     wake_word_reset_barge_in();
 
-    /* 唤醒、按键、重连、取消和正常回复统一保证上传时使用 LITE 模式。 */
-    if (wake_word_get_mode() != WAKE_WORD_MODE_LITE) {
-        if (wake_word_set_mode(WAKE_WORD_MODE_LITE) == ESP_OK) {
-            ESP_LOGI(TAG, "AFE mode -> LITE (WakeNet disabled for audio)");
-        }
-    }
     resume_deadline_ms = 0;
     led_set_listening();
     ESP_LOGI(TAG, "Conversation listening; source=%s; ready for the next question", reason);
 }
 
-/* 唤醒词和 REC 共用入口：待机不上传，认证成功后才开始监听。 */
+/* 唤醒词、按键和触屏共用入口：待机不上传，认证成功后才开始监听。 */
 static void start_conversation(const char *reason)
 {
     if (provisioning_service_is_active()) {
@@ -216,13 +251,16 @@ static void start_conversation(const char *reason)
 /* 手动/语音打断共用取消边界；只在主任务操作 WS，保留已有预录音补传逻辑。 */
 static void interrupt_response(bool manual)
 {
-    if (!conversation_active || app_state_get() != APP_STATE_PLAYING ||
+    const bool unfinished_input = app_state_get() == APP_STATE_LISTENING;
+    if (!conversation_active || (!unfinished_input && app_state_get() != APP_STATE_PLAYING) ||
         ws_service_get_state() != WS_STATE_CONNECTED) return;
     if (manual) wake_word_protect_preroll();
     esp_err_t err = ws_service_cancel_response();
     if (err == ESP_ERR_NOT_FOUND) {
         /* 回答恰好结束，队列内的正常完成事件负责恢复监听。 */
         wake_word_reset_barge_in();
+        if (unfinished_input)
+            audio_in_start_from_ringbuf(audio_in_get_handle(), wake_word_get_ringbuf());
         return;
     }
     if (err != ESP_OK) { recover_session("response.cancel send failed"); return; }
@@ -232,7 +270,89 @@ static void interrupt_response(bool manual)
     cancel_probe_ms = now_ms() + 3000;
     cancel_deadline_ms = now_ms() + 8000;
     ESP_LOGI(TAG, "Playback stopped (%s); waiting for cancelled reply boundary",
-             manual ? "REC" : "voice");
+             unfinished_input ? "unfinished input" : (manual ? "manual" : "voice"));
+}
+
+/* speech_stopped 只是平台断句候选；先验证本地输入，再允许 worker 播放。
+ * 本函数只在主任务运行，不在 WS 回调或 AFE 任务里暂停上传/发送取消。 */
+static void process_reply_offer(void)
+{
+    ws_reply_offer_t offer;
+    if (!conversation_active) return;
+    if (!ws_service_get_reply_offer(&offer)) return;
+    app_state_t current = app_state_get();
+    if (current != APP_STATE_LISTENING && current != APP_STATE_PLAYING) return;
+    if (!input_handoff.observer || input_handoff.offer.generation != offer.generation ||
+        input_handoff.offer.turn != offer.turn) {
+        reset_input_handoff();
+        input_handoff.offer = offer;
+        input_handoff.started_ms = now_ms();
+        input_handoff.observer = wake_word_watch_input_handoff();
+        if (!input_handoff.observer) { recover_session("could not observe input handoff"); return; }
+        app_state_pause_silence_timer();
+    }
+    audio_in_handle_t input = audio_in_get_handle();
+    audio_in_upload_status_t upload;
+    audio_in_get_upload_status(input, &upload);
+    if (current == APP_STATE_LISTENING && !upload.running) {
+        recover_session("input ended before reply handoff"); return;
+    }
+    bool speech_pending, speech_confirmed;
+    if (!wake_word_get_input_handoff(input_handoff.observer, &speech_pending, &speech_confirmed)) {
+        reset_input_handoff(); return;
+    }
+    input_handoff_action_t action = input_handoff_decide(upload.running, upload.replaying,
+        upload.speech_end, upload.sent_end, speech_pending, speech_confirmed);
+    if (action != INPUT_HANDOFF_DRAIN && upload.running) {
+        /* 接受回答前也暂停并重新检查，处理“刚检查完，AFE 又来了一帧”的窗口。
+         * 暂停保留半包及 FIFO；需要继续补传时恢复原任务，不调用 stop 清数据。 */
+        if (audio_in_pause(input) != ESP_OK) { recover_session("input pause timed out"); return; }
+        audio_in_get_upload_status(input, &upload);
+        if (!upload.running) { recover_session("input ended while pausing"); return; }
+        ws_reply_offer_t latest;
+        if (!ws_service_get_reply_offer(&latest) || latest.generation != offer.generation ||
+            latest.turn != offer.turn || !wake_word_get_input_handoff(input_handoff.observer,
+                                                                     &speech_pending, &speech_confirmed)) {
+            audio_in_start_from_ringbuf(input, wake_word_get_ringbuf());
+            reset_input_handoff(); return;
+        }
+        action = input_handoff_decide(upload.running, upload.replaying,
+            upload.speech_end, upload.sent_end, speech_pending, speech_confirmed);
+        if (action == INPUT_HANDOFF_DRAIN)
+            audio_in_start_from_ringbuf(input, wake_word_get_ringbuf());
+    }
+    if (action == INPUT_HANDOFF_CANCEL) {
+        ESP_LOGI(TAG, "Fresh speech confirmed after reply offer: turn=%lu; cancel response, retain input",
+                 (unsigned long)offer.turn);
+        reset_input_handoff();
+        interrupt_response(false);
+        return;
+    }
+    if (action == INPUT_HANDOFF_DRAIN) {
+        if (!input_handoff.logged_wait) {
+            input_handoff.logged_wait = true;
+            uint32_t lag = input_samples_pending(upload.speech_end, upload.sent_end)
+                           ? (upload.speech_end - upload.sent_end) / 16u : 0;
+            ESP_LOGI(TAG, "Reply held: turn=%lu unsent_speech_ms=%lu replaying=%d; draining input, no cancel",
+                     (unsigned long)offer.turn, (unsigned long)lag, upload.replaying);
+        }
+        if (now_ms() - input_handoff.started_ms >= 10000) {
+            recover_session("microphone input handoff did not drain");
+        }
+        return;
+    }
+    reset_input_handoff();
+    if (audio_in_stop(input) != ESP_OK) { recover_session("audio stop timeout"); return; }
+    app_state_pause_silence_timer();
+    app_state_set(APP_STATE_PLAYING);
+    response_deadline_ms = now_ms() + 45000;
+    if (!ws_service_accept_reply(&offer)) {
+        /* 停任务期间又收到新回合/断线，旧批准不能放行新音频；继续交接新输入。 */
+        resume_listening(true, "reply offer superseded");
+        return;
+    }
+    ESP_LOGI(TAG, "Input handoff complete: turn=%lu; waiting for reply audio",
+             (unsigned long)offer.turn);
 }
 
 static esp_err_t start_saved_wifi(void)
@@ -307,6 +427,72 @@ static void save_volume_if_due(int64_t now)
     }
 }
 
+static void change_brightness(bool increase)
+{
+    if (!s_ui_ready) return;
+    int next = ui_brightness_next(s_brightness, increase);
+    if (next == s_brightness) return;
+    esp_err_t err = display_service_set_brightness(next);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Brightness change failed: %s", esp_err_to_name(err));
+        return;
+    }
+    s_brightness = next;
+    s_brightness_save_at_ms = now_ms() + 1500;
+    ESP_LOGI(TAG, "Brightness: %d%%", next);
+}
+
+static void save_brightness_if_due(int64_t now)
+{
+    if (!s_brightness_save_at_ms || now < s_brightness_save_at_ms) return;
+    if (s_brightness == s_saved_brightness) { s_brightness_save_at_ms = 0; return; }
+    esp_err_t err = cfg_service_set_int(CFG_KEY_BRIGHTNESS, s_brightness);
+    if (err == ESP_OK) {
+        s_saved_brightness = s_brightness;
+        s_brightness_save_at_ms = 0;
+        ESP_LOGI(TAG, "Brightness saved: %d%%", s_brightness);
+    } else {
+        s_brightness_save_at_ms = now + 5000;
+        ESP_LOGW(TAG, "Brightness save failed; retry in 5s: %s", esp_err_to_name(err));
+    }
+}
+
+/* 业务状态由主任务生成快照；UI 不读取会话变量，也不持有网络/NVS 锁。
+ * 平台 HTTP 握手接入时，在这里增加状态映射即可，绘图模块不依赖握手实现。 */
+static void update_ui_snapshot(int64_t now)
+{
+    static int64_t next_update;
+    if (!s_ui_ready || now < next_update) return;
+    next_update = now + 150;
+    ui_snapshot_t snapshot = {0};
+    snapshot.volume = audio_out_get_volume();
+    snapshot.brightness = s_brightness;
+    snapshot.provisioning = provisioning_service_is_active();
+    snapshot.wifi_connected = wifi_service_get_ssid(snapshot.ssid, sizeof(snapshot.ssid));
+    wifi_state_t wifi = wifi_service_get_state();
+    snapshot.wifi_connecting = wifi == WIFI_STATE_CONNECTING || wifi == WIFI_STATE_CONNECTED;
+    if (snapshot.provisioning) {
+        snapshot.status = UI_STATUS_PROVISIONING;
+        provisioning_service_get_info(snapshot.ap_ssid, sizeof(snapshot.ap_ssid),
+                                      snapshot.provisioning_url, sizeof(snapshot.provisioning_url));
+    } else if (!snapshot.wifi_connected) {
+        snapshot.status = snapshot.wifi_connecting ? UI_STATUS_WIFI_CONNECTING : UI_STATUS_OFFLINE;
+    } else {
+        switch (app_state_get()) {
+        case APP_STATE_LISTENING: snapshot.status = UI_STATUS_LISTENING; break;
+        case APP_STATE_PLAYING:
+            snapshot.status = audio_out_is_streaming() ? UI_STATUS_SPEAKING : UI_STATUS_WAIT_REPLY;
+            break;
+        case APP_STATE_CANCELLING: snapshot.status = UI_STATUS_CANCELLING; break;
+        case APP_STATE_WS_CONNECTING:
+        case APP_STATE_WS_CONNECTING_WAKE: snapshot.status = UI_STATUS_CONNECTING; break;
+        case APP_STATE_ERROR: snapshot.status = UI_STATUS_ERROR; break;
+        default: snapshot.status = session_requested ? UI_STATUS_CONNECTING : UI_STATUS_WAIT_WAKE; break;
+        }
+    }
+    ui_service_update(&snapshot);
+}
+
 static bool tagged_ws_event(event_type_t id)
 {
     return id == EV_WS_CONNECTED || id == EV_WS_AUTH_OK || id == EV_WS_ERROR ||
@@ -366,22 +552,41 @@ static void main_task(void *arg)
                     end_conversation("Wi-Fi disconnected");
                 }
                 break;
-            /* 保留 YMOS 的业务事件入口供后续触屏使用；本版 BOOT 不发布这些事件。 */
+            /* 按键和 UI 共用业务动作；所有网络/Codec/NVS 操作留在主任务。 */
             case EV_BUTTON_VOLUME_DOWN:
             case EV_BUTTON_VOLUME_UP:
                 change_volume(event.type == EV_BUTTON_VOLUME_UP);
                 break;
+            case EV_UI_TALK:
             case EV_BUTTON_TALK:
+                /* 首页监听画面轻触结束对话；取消阶段也显示监听，采用同一操作。
+                 * 复用完整收尾入口，清除会话意图/重试期限，迟到的取消确认不能重新拉起监听。
+                 * 只改变触屏行为，保留实体 REC 键的原有规则。 */
+                if (event.type == EV_UI_TALK &&
+                    (current_state == APP_STATE_LISTENING || current_state == APP_STATE_CANCELLING)) {
+                    end_conversation("touch while listening");
+                    break;
+                }
                 if (current_state == APP_STATE_PLAYING) interrupt_response(true);
                 else {
-                    start_conversation("REC button");
+                    start_conversation(event.type == EV_UI_TALK ? "touch" : "REC button");
                 }
+                break;
+            case EV_UI_BRIGHTNESS_DOWN:
+            case EV_UI_BRIGHTNESS_UP:
+                change_brightness(event.type == EV_UI_BRIGHTNESS_UP);
                 break;
             case EV_BUTTON_END_TALK:
                 if (!provisioning_service_is_active()) end_conversation("REC held for 2s");
                 break;
             case EV_BUTTON_PROVISION:
                 enter_provisioning("BOOT held for 3s");
+                break;
+            case EV_UI_PROVISION:
+                enter_provisioning("touch menu");
+                break;
+            case EV_UI_PROVISION_EXIT:
+                leave_provisioning("touch menu cancelled");
                 break;
             case EV_WS_CONNECTED:
                 ESP_LOGI(TAG, "WebSocket transport connected; authenticating");
@@ -416,16 +621,7 @@ static void main_task(void *arg)
                 break;
             case EV_WS_SPEECH_STOPPED:
             case EV_WS_RESPONSE_CONTINUED:
-                if (!conversation_active || current_state != APP_STATE_LISTENING) break;
-                ESP_LOGI(TAG, "%s; waiting for reply", event.type == EV_WS_RESPONSE_CONTINUED ?
-                         "Server response continued after tool stage" : "Server speech_stopped");
-                app_state_pause_silence_timer();
-                if (audio_in_stop(audio_in_get_handle()) != ESP_OK) {
-                    recover_session("audio stop timeout");
-                    break;
-                }
-                app_state_set(APP_STATE_PLAYING);
-                response_deadline_ms = now_ms() + 45000;
+                /* worker 已设交接门；下方轮询当前 offer，避免迟到事件关掉新输入。 */
                 break;
             case EV_AUDIO_OUT_START:
                 if (conversation_active && current_state == APP_STATE_PLAYING &&
@@ -462,7 +658,10 @@ static void main_task(void *arg)
             }
         }
         int64_t now = now_ms();
+        process_reply_offer();
         save_volume_if_due(now);
+        save_brightness_if_due(now);
+        update_ui_snapshot(now);
         if (cancel_probe_ms && now >= cancel_probe_ms) {
             cancel_probe_ms = 0;
             ESP_LOGW(TAG, "Cancel confirmation delayed; keeping connection while waiting (limit 8 s)");

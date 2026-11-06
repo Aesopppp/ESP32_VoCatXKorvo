@@ -58,6 +58,7 @@ typedef enum {
     CFG_KEY_REMINDER_USE_TOKEN,
     CFG_KEY_REMINDER_USERNAME,
     CFG_KEY_REMINDER_PASSWORD,
+    CFG_KEY_BRIGHTNESS, /* 追加键，保留旧配置映射；10..100，缺省由 UI 策略提供。 */
     CFG_KEY_MAX,
 } cfg_key_t;
 

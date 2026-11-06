@@ -1,0 +1,24 @@
+{
+  "format_version": 1,
+  "fps": 20,
+  "source": "espressif2022/esp_emote_assets 0.1.2",
+  "source_commit": "29aa5259ac22651b8636683698c021482050b206",
+  "animations": [
+    {
+      "file": "neutral.eaf",
+      "sha256": "21280165824bbf806dc75d76f8ef0b0cdf73ce43c9ce9eda762f93a2da5dac87"
+    },
+    {
+      "file": "winking.eaf",
+      "sha256": "0969d76cd6dff1add4a140b4614025bf11703baa038b4b6190d0a22ea31eebd4"
+    },
+    {
+      "file": "confused.eaf",
+      "sha256": "dafcdbe72939d7ef1061466caa30eb83517e953f284b53d9f6d708ac4319a05d"
+    },
+    {
+      "file": "listen.eaf",
+      "sha256": "e7a000326797b73c87387e27dfdd5c2941ece32568080d1c6ef6947fd01c7f28"
+    }
+  ]
+}

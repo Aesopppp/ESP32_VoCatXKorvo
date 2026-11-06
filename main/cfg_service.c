@@ -51,6 +51,7 @@ static const char *s_key_names[] = {
     "mqtt_enabled", "mqtt_host", "mqtt_port", "mqtt_client_id",
     "mqtt_username", "mqtt_password", "mqtt_base_topic", "chip_id",
     "rm_enabled", "rm_uri", "rm_api_key", "rm_token", "rm_username", "rm_password",
+    "brightness",
     "",
 };
 

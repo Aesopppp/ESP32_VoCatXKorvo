@@ -117,6 +117,18 @@ esp_err_t audio_in_start_from_ringbuf(audio_in_handle_t h, RingbufHandle_t ringb
  */
 esp_err_t audio_in_stop(audio_in_handle_t h);
 
+/** 暂停上传用于取消抢答：保留当前 PCM、半包 Opus、编码器及补传计数。
+ * 仅主任务调用，最多等 2 秒；start_from_ringbuf 恢复同一任务，stop 仍完整退出。 */
+esp_err_t audio_in_pause(audio_in_handle_t h);
+typedef struct {
+    bool running;
+    bool replaying;
+    uint32_t sent_end;
+    uint32_t speech_end;
+} audio_in_upload_status_t;
+/** 线程安全的交接快照，采样单位为 16 kHz PCM；不读取编码器内部状态。 */
+void audio_in_get_upload_status(audio_in_handle_t h, audio_in_upload_status_t *status);
+
 /**
  * @brief 注册 PCM 帧回调
  */

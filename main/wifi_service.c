@@ -271,6 +271,17 @@ wifi_state_t wifi_service_get_state(void)
     return get_state();
 }
 
+bool wifi_service_get_ssid(char *buf, size_t buf_size)
+{
+    if (!buf || buf_size < 33) return false;
+    buf[0] = '\0';
+    wifi_ap_record_t ap = {0};
+    if (get_state() != WIFI_STATE_GOT_IP || esp_wifi_sta_get_ap_info(&ap) != ESP_OK) return false;
+    memcpy(buf, ap.ssid, 32);
+    buf[32] = '\0';
+    return true;
+}
+
 bool wifi_service_get_ip_str(char *buf, size_t buf_size)
 {
     if (!buf || buf_size < 16) return false;

@@ -15,6 +15,7 @@ typedef struct {
     bool tool_pending;
     bool continuation_allowed;
     bool id_from_created;
+    bool input_held; /* speech_stopped 后，等主任务确认输入交接再播放 */
     char response_id[PROTO_RESPONSE_ID_SIZE];
     char retired_id[PROTO_RESPONSE_ID_SIZE];
 } response_stream_t;
@@ -31,6 +32,9 @@ void response_stream_reset(response_stream_t *stream);
 void response_stream_begin(response_stream_t *stream, uint32_t turn);
 void response_stream_user_started(response_stream_t *stream);
 bool response_stream_accept_audio(response_stream_t *stream, uint32_t turn);
+void response_stream_hold_input(response_stream_t *stream);
+bool response_stream_release_input(response_stream_t *stream, uint32_t turn);
+bool response_stream_input_held(const response_stream_t *stream, uint32_t turn);
 response_stream_action_t response_stream_control(response_stream_t *stream, uint32_t turn,
                                                   const proto_msg_t *msg);
 bool response_stream_finish_if_drained(response_stream_t *stream, bool drained,

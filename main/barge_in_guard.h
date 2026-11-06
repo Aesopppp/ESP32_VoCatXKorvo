@@ -52,6 +52,12 @@ static inline BARGE_IN_CONSTEXPR uint32_t barge_in_samples_to_ms(uint32_t sample
     return samples * 1000u / BARGE_IN_SAMPLE_RATE;
 }
 
+/* 等回复时不应用扬声器起播保护；实际起播后仍按原保护时长判断。 */
+static inline BARGE_IN_CONSTEXPR uint32_t barge_in_guard_age(bool playing, uint32_t age_ms)
+{
+    return playing ? age_ms : BARGE_IN_GUARD_MS;
+}
+
 static inline BARGE_IN_CONSTEXPR void barge_in_guard_reset(barge_in_guard_t *guard)
 {
     guard->samples = 0;

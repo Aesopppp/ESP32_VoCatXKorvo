@@ -49,13 +49,31 @@ void response_stream_user_started(response_stream_t *stream)
 
 bool response_stream_accept_audio(response_stream_t *stream, uint32_t turn)
 {
-    if (!reply_packet_current(stream->turn, turn) || !response_accept_audio(&stream->phase))
+    if (stream->input_held || !reply_packet_current(stream->turn, turn) ||
+        !response_accept_audio(&stream->phase))
         return false;
     /* V1 不保证发送 created/message；当前回合的 raw Opus 本身也表示工具后续
      * 语音已开始。仅在接受音频后解除工具等待，旧回合/取消/丢弃均不能走到这里。
      * 第一段已 EOF 时，继续同一 FIFO 的后续音频，等待本段新的 audio.done。 */
     stream->tool_pending = false;
     stream->audio_eof = false;
+    return true;
+}
+
+void response_stream_hold_input(response_stream_t *stream)
+{
+    stream->input_held = true;
+}
+
+bool response_stream_input_held(const response_stream_t *stream, uint32_t turn)
+{
+    return stream->input_held && stream->turn == turn && active(stream);
+}
+
+bool response_stream_release_input(response_stream_t *stream, uint32_t turn)
+{
+    if (!response_stream_input_held(stream, turn)) return false;
+    stream->input_held = false;
     return true;
 }
 
@@ -134,7 +152,7 @@ bool response_stream_finish_if_drained(response_stream_t *stream, bool drained,
 {
     /* worker 不能在第一个 audio.done 之后越过 FIFO 中仍待处理的后续段。
      * wire_audio_done 防止 RX 已收到下一段、但尚未完成入队时抢先完成。 */
-    if (stream->tool_pending || !queue_empty || !wire_audio_done ||
+    if (stream->input_held || stream->tool_pending || !queue_empty || !wire_audio_done ||
         !response_playback_finished(stream->phase, stream->audio_eof, drained)) return false;
     response_finish(&stream->phase);
     stream->audio_eof = false;
@@ -144,5 +162,6 @@ bool response_stream_finish_if_drained(response_stream_t *stream, bool drained,
 bool response_stream_begin_cancel(response_stream_t *stream)
 {
     stream->continuation_allowed = false;
+    stream->input_held = false; /* 放行 worker 丢弃旧音频，继续读取取消确认。 */
     return response_begin_cancel(&stream->phase);
 }

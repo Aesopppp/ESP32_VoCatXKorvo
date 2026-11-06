@@ -5,3 +5,4 @@ app0, app, ota_0, 0x10000, 0x300000,
 app1, app, ota_1, 0x310000, 0x300000,
 model, data, spiffs, 0x610000, 0x1EF000,
 nvs_keys, data, nvs_keys, 0x7FF000, 0x1000, encrypted
+ui_assets, data, 0x40, 0x800000, 0x100000,

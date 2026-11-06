@@ -36,7 +36,18 @@ extern "C" {
 #define BSP_CODEC_POWER_PIN     GPIO_NUM_48  /* 高电平使能 v1.2 音频电源 */
 #define BSP_PA_EN_PIN           GPIO_NUM_15  /* 功放使能由 ES8311 驱动管理 */
 #define BSP_POWER_CTRL_PIN      GPIO_NUM_9   /* 保持 VoCat 原板级低电平 */
-#define BSP_LCD_BACKLIGHT_PIN   GPIO_NUM_44  /* 本版不接屏幕，保持关闭 */
+#define BSP_LCD_BACKLIGHT_PIN   GPIO_NUM_44  /* 启动先关闭，由 display_service 接管 PWM */
+#define BSP_LCD_WIDTH           360
+#define BSP_LCD_HEIGHT          360
+#define BSP_LCD_SCLK_PIN         GPIO_NUM_18
+#define BSP_LCD_CS_PIN           GPIO_NUM_14
+#define BSP_LCD_DATA0_PIN        GPIO_NUM_46
+#define BSP_LCD_DATA1_PIN        GPIO_NUM_13
+#define BSP_LCD_DATA2_PIN        GPIO_NUM_11
+#define BSP_LCD_DATA3_PIN        GPIO_NUM_12
+#define BSP_LCD_RESET_PIN        GPIO_NUM_47  /* v1.2 高电平复位 */
+#define BSP_TOUCH_I2C_ADDR       0x15
+#define BSP_TOUCH_INT_PIN        GPIO_NUM_10
 #define BSP_BOOT_BUTTON_PIN     GPIO_NUM_0   /* 低电平按下，运行中长按 3 秒配网 */
 
 /* Wi-Fi / NVS：沿用原工程配置；ACOS 本机凭据由配置服务一次性写入 NVS。 */
