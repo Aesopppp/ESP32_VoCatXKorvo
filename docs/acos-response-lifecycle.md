@@ -1,5 +1,7 @@
 # ACOS 工具调用与多段回复的本地兼容处理
 
+> 从 YMOS 保留的历史分析。VoCat 当前实现以 [平台打断](platform-barge-in.md) 为准；取消握手、预录音补传与旧多段 EOF 规则已不再使用。
+
 适用工程：`D:\ESP32-ymos-1`；ESP32-S3-Korvo-2 V3.1；ESP-IDF 6.1。
 
 ## 对接依据与问题证据

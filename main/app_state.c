@@ -20,13 +20,14 @@ app_state_t app_state_handle_event(const app_event_t *evt, app_state_t prev)
     case EV_AUDIO_WAKE_DETECTED:
         return app_state_start_listening()==ESP_OK ? APP_STATE_LISTENING : APP_STATE_ERROR;
     case EV_AUDIO_SPEECH_START:
-        app_state_reset_silence_timer(); return APP_STATE_LISTENING;
+        /* 本地 VAD 仅更新静默计时，不改变播放状态。 */
+        if (prev == APP_STATE_LISTENING) app_state_reset_silence_timer();
+        return prev;
     case EV_AUDIO_OUT_START:
         return APP_STATE_PLAYING;
-    case EV_AUDIO_BARGE_IN:
-        /* The main task handles the barge-in side effects in a strict order:
-         * stop playback, cancel the server response, then restart audio_in.
-         * Do not start the upload task here or it can race response.cancel. */
+    case EV_WS_SPEECH_STARTED:
+    case EV_WS_RESPONSE_INTERRUPTED:
+        /* worker 已处理平台打断；主任务负责实际 UI 和计时器变更。 */
         return APP_STATE_LISTENING;
     case EV_AUDIO_SILENCE_TIMEOUT:
         app_state_back_to_wait_wake(true); return APP_STATE_WAIT_WAKE;
@@ -201,12 +202,8 @@ esp_err_t app_state_start_listening(void)
         return ESP_ERR_INVALID_STATE;
     }
     app_state_set(APP_STATE_LISTENING);
-    /*
-     * 持续对话模式下，服务端发送 speech_stopped 后 app_main 会停止
-     * audio_in，等待云端播放回答。response_done 之后状态仍然是
-     * LISTENING，因此这里不能因为状态相同而直接返回，必须确认并重新
-     * 启动 audio_in。audio_in_start_from_ringbuf() 本身对已运行任务是幂等的。
-     */
+    /* 播放/平台打断期间保持同一上传任务；首次认证后才需要创建。
+     * 幂等 start 不清空半包 PCM、不重置编码器，避免截掉句首。 */
     audio_in_handle_t ai = audio_in_get_handle();
     esp_err_t err = audio_in_start_from_ringbuf(ai, wake_word_get_ringbuf());
     if (err != ESP_OK) {

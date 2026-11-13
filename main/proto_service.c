@@ -125,11 +125,13 @@ proto_result_t proto_parse_json(const char *json_str, proto_msg_t *msg)
     if (strcmp(type, "__proxy_connected__") == 0) {
         msg->evt = PROTO_EVT_PROXY_CONNECTED;
         if (!copy_field(root, "session_id", msg->session_id, sizeof(msg->session_id), &msg->session_id_len)) goto done;
-    } else if (strcmp(type, "input_audio_buffer.speech_started") == 0) {
+    } else if (strcmp(type, "input_audio_buffer.speech_started") == 0 ||
+               strcmp(type, "conversation.item.input_audio_transcription.started") == 0) {
         msg->evt = PROTO_EVT_SPEECH_STARTED;
-    } else if (strcmp(type, "input_audio_buffer.speech_stopped") == 0) {
+    } else if (strcmp(type, "input_audio_buffer.speech_stopped") == 0 ||
+               strcmp(type, "conversation.item.input_audio_transcription.completed") == 0) {
         msg->evt = PROTO_EVT_SPEECH_STOPPED;
-    } else if (strcmp(type, "response.audio.done") == 0) {
+    } else if (strcmp(type, "response.audio.done") == 0 || strcmp(type, "response.output_audio.done") == 0) {
         msg->evt = PROTO_EVT_RESPONSE_DONE;
     } else if (strcmp(type, "response.done") == 0) {
         msg->evt = PROTO_EVT_RESPONSE_TERMINAL;
@@ -175,13 +177,43 @@ done:
 void proto_msg_clear(proto_msg_t *msg) { if (msg) memset(msg, 0, sizeof(*msg)); }
 
 /* ---- builders ---------------------------------------------------------- */
+bool proto_is_auth_error(const proto_msg_t *msg)
+{
+    if (!msg || msg->evt != PROTO_EVT_ERROR) return false;
+    if (msg->error_code == 2000 || msg->error_code == 401 || msg->error_code == 403) return true;
+    static const char *codes[] = { "invalid_api_key", "api_key_invalid", "invalid_token",
+        "token_expired", "authentication_error", "unauthorized", "forbidden" };
+    for (size_t i = 0; i < sizeof(codes) / sizeof(codes[0]); ++i)
+        if (strcmp(msg->error_code_text, codes[i]) == 0) return true;
+    return false;
+}
+
 size_t proto_build_auth_frame(char *buf, size_t buf_size, const char *token)
 {
-    if (!buf || !token) return 0;
-    int n = snprintf(buf, buf_size,
-                     "{\"type\":\"auth\",\"token\":\"%s\"}",
-                     token);
-    return (n > 0 && (size_t)n < buf_size) ? (size_t)n : 0;
+    if (!buf || !buf_size) return 0;
+    buf[0] = 0;
+    if (!token || !*token || strlen(token) > PROTO_AUTH_TOKEN_MAX) return 0;
+    static const char prefix[] = "{\"type\":\"auth\",\"token\":\"";
+    size_t length = sizeof(prefix) - 1;
+    /* 先测完整长度再写入；转义引号、反斜线和控制字节，失败时不返回半条凭据。 */
+    for (const unsigned char *p = (const unsigned char *)token; *p; ++p)
+        length += *p < 32 ? 6 : (*p == '"' || *p == '\\') ? 2 : 1;
+    length += 2; /* 末尾引号和右花括号，不包含 NUL。 */
+    if (buf_size <= length) return 0;
+    memcpy(buf, prefix, sizeof(prefix) - 1);
+    char *out = buf + sizeof(prefix) - 1;
+    static const char hex[] = "0123456789abcdef";
+    for (const unsigned char *p = (const unsigned char *)token; *p; ++p) {
+        if (*p < 32) {
+            *out++ = '\\'; *out++ = 'u'; *out++ = '0'; *out++ = '0';
+            *out++ = hex[*p >> 4]; *out++ = hex[*p & 15];
+        } else {
+            if (*p == '"' || *p == '\\') *out++ = '\\';
+            *out++ = (char)*p;
+        }
+    }
+    *out++ = '"'; *out++ = '}'; *out = 0;
+    return length;
 }
 
 size_t proto_build_input_audio_append(char *buf, size_t buf_size,

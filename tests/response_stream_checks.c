@@ -1,8 +1,6 @@
 /* 运行生产 JSON 解析和回复流策略，重放工具调用、多段音频与取消的事件顺序。
  * 主机命令见 docs/acos-response-lifecycle.md；不模拟 DMA/RTOS/平台服务。 */
 #include "../main/response_stream.h"
-#include "../main/input_handoff.h"
-#include "../main/barge_in_guard.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -90,17 +88,12 @@ static void normal_reply_checks(void)
     CHECK(control(&stream, "{\"type\":\"response.audio.done\"}") == RESPONSE_STREAM_NONE);
 
     response_stream_begin(&stream, 4);
-    unsigned decoded = 0;
-    for (unsigned i = 0; i < 76; ++i) { CHECK(response_stream_accept_audio(&stream, 4)); ++decoded; }
-    CHECK(control(&stream, "{\"type\":\"response.audio.done\",\"response_id\":\"segment_a\"}") == RESPONSE_STREAM_AUDIO_END);
-    CHECK(!response_stream_finish_if_drained(&stream, true, false, true)); /* FIFO 尚有后续段 */
-    CHECK(control(&stream, "{\"type\":\"response.done\",\"status\":\"completed\"}") == RESPONSE_STREAM_NONE);
-    for (unsigned i = 0; i < 100; ++i) { CHECK(response_stream_accept_audio(&stream, 4)); ++decoded; }
-    CHECK(decoded == 176 && !stream.audio_eof);
-    CHECK(!response_stream_finish_if_drained(&stream, true, true, false));
-    CHECK(control(&stream, "{\"type\":\"response.audio.done\",\"response_id\":\"segment_b\"}") == RESPONSE_STREAM_AUDIO_END);
-    CHECK(response_stream_finish_if_drained(&stream, true, true, true));
-    CHECK(!response_stream_accept_audio(&stream, 3)); /* 旧回合 */
+    for (unsigned i=0;i<76;++i) CHECK(response_stream_accept_audio(&stream,4));
+    CHECK(control(&stream,"{\"type\":\"response.audio.done\"}")==RESPONSE_STREAM_AUDIO_END);
+    for (unsigned i=0;i<100;++i) CHECK(!response_stream_accept_audio(&stream,4));
+    CHECK(!response_stream_finish_if_drained(&stream,false,true,true));
+    CHECK(response_stream_finish_if_drained(&stream,true,true,true));
+    CHECK(!response_stream_accept_audio(&stream,3));
 
     response_stream_begin(&stream, 5);
     control(&stream, "{\"type\":\"response.output_item.added\",\"item\":{\"type\":\"message\"}}");
@@ -118,10 +111,10 @@ static void tool_reply_checks(void)
     control(&stream, "{\"type\":\"response.created\",\"response\":{\"id\":\"tool_1\"}}");
     control(&stream, "{\"type\":\"response.output_item.added\",\"response_id\":\"tool_1\",\"item\":{\"type\":\"function_call\"}}");
     control(&stream, "{\"type\":\"response.audio.done\",\"response_id\":\"tool_1\"}");
-    CHECK(stream.tool_pending && !response_stream_finish_if_drained(&stream, true, true, true));
+    CHECK(!stream.tool_pending && stream.audio_eof);
     control(&stream, "{\"type\":\"response.done\",\"response\":{\"id\":\"tool_1\",\"status\":\"completed\","
                      "\"output\":[{\"type\":\"function_call\",\"name\":\"create_reminder\"}]}}");
-    CHECK(stream.tool_pending && !stream.audio_eof);
+    CHECK(!stream.tool_pending && stream.audio_eof);
     control(&stream, "{\"type\":\"response.created\",\"response\":{\"id\":\"reply_2\"}}");
     CHECK(!stream.tool_pending && stream.phase == RESPONSE_WAITING);
     CHECK(response_stream_accept_audio(&stream, 8));
@@ -139,98 +132,34 @@ static void tool_reply_checks(void)
     CHECK(response_stream_finish_if_drained(&stream, true, true, true));
     response_stream_user_started(&stream);
     control(&stream, "{\"type\":\"response.created\",\"response\":{\"id\":\"late_4\"}}");
-    CHECK(stream.phase == RESPONSE_IDLE && !response_stream_accept_audio(&stream, 8));
+    CHECK(stream.phase == RESPONSE_DISCARD && !response_stream_accept_audio(&stream, 8));
 }
 
 static void tool_audio_fallback_checks(void)
 {
-    /* ACOS V1 不保证发送 created/message；工具后直接返回 raw Opus 也必须续播。
-     * 同时覆盖带工具 created、但没有后续 reply created 的可选扩展链路。 */
-    for (unsigned with_created = 0; with_created < 2; ++with_created) {
+    for (unsigned with_created=0;with_created<2;++with_created) {
         response_stream_t stream;
-        response_stream_begin(&stream, 9);
-        if (with_created)
-            control(&stream, "{\"type\":\"response.created\",\"response_id\":\"tool_1\"}");
-        control(&stream, "{\"type\":\"response.done\",\"response\":{\"id\":\"tool_1\","
-                         "\"status\":\"completed\",\"output\":[{\"type\":\"function_call\"}]}}");
-        CHECK(stream.tool_pending && stream.phase == RESPONSE_WAITING);
-        control(&stream, "{\"type\":\"response.audio.done\"}");
-        CHECK(!response_stream_finish_if_drained(&stream, true, true, true)); /* 工具阶段无音频 */
-        CHECK(!response_stream_accept_audio(&stream, 8));
-        CHECK(stream.tool_pending); /* 旧回合音频不能解除等待 */
-        CHECK(response_stream_accept_audio(&stream, 9));
-        CHECK(!stream.tool_pending && !stream.audio_eof && stream.phase == RESPONSE_PLAYING);
-        CHECK(!response_stream_finish_if_drained(&stream, true, true, true)); /* 仍需新 EOF */
-        control(&stream, "{\"type\":\"response.audio.done\"}");
-        CHECK(!response_stream_finish_if_drained(&stream, false, true, true)); /* 不截 PCM 尾音 */
-        CHECK(!response_stream_finish_if_drained(&stream, true, false, true)); /* 不越过 FIFO */
-        CHECK(!response_stream_finish_if_drained(&stream, true, true, false)); /* 后段正在入队 */
-        CHECK(response_stream_finish_if_drained(&stream, true, true, true));
-        CHECK(!response_stream_accept_audio(&stream, 9)); /* 不重开已完成回合 */
-
-        response_stream_begin(&stream, 10);
-        CHECK(response_stream_accept_audio(&stream, 10));
-        control(&stream, "{\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\"}}");
-        control(&stream, "{\"type\":\"response.audio.done\"}");
-        CHECK(stream.tool_pending && !response_stream_finish_if_drained(&stream, true, true, true));
-        CHECK(response_stream_accept_audio(&stream, 10)); /* 再次工具调用后确实收到续流 */
+        response_stream_begin(&stream,9);
+        if(with_created) control(&stream,"{\"type\":\"response.created\",\"response_id\":\"tool_1\"}");
+        control(&stream,"{\"type\":\"response.done\",\"response\":{\"id\":\"tool_1\",\"status\":\"completed\",\"output\":[{\"type\":\"function_call\"}]}}");
+        CHECK(stream.tool_pending);
+        CHECK(!response_stream_accept_audio(&stream,8));
+        CHECK(response_stream_accept_audio(&stream,9));
         CHECK(!stream.tool_pending);
-        control(&stream, "{\"type\":\"response.audio.done\"}");
-        CHECK(response_stream_finish_if_drained(&stream, true, true, true));
-
-        response_stream_begin(&stream, 11);
-        control(&stream, "{\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\"}}");
-        CHECK(response_stream_begin_cancel(&stream));
-        CHECK(!response_stream_accept_audio(&stream, 11));
-        CHECK(stream.tool_pending && stream.phase == RESPONSE_CANCELLING);
-        CHECK(control(&stream, "{\"type\":\"response.audio.done\"}") == RESPONSE_STREAM_CANCELLED);
-        CHECK(!response_stream_accept_audio(&stream, 11) && stream.phase == RESPONSE_DISCARD);
+        control(&stream,"{\"type\":\"response.audio.done\"}");
+        CHECK(!response_stream_accept_audio(&stream,9));
+        control(&stream,"{\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\"}}");
+        CHECK(stream.audio_eof && !stream.tool_pending);
+        CHECK(!response_stream_finish_if_drained(&stream,false,true,true));
+        CHECK(response_stream_finish_if_drained(&stream,true,true,true));
+        CHECK(control(&stream,"{\"type\":\"response.created\",\"response_id\":\"tool_2\"}")==RESPONSE_STREAM_CONTINUED);
+        CHECK(response_stream_accept_audio(&stream,9));
+        response_stream_user_started(&stream);
+        CHECK(!response_stream_accept_audio(&stream,9));
+        CHECK(control(&stream,"{\"type\":\"response.audio.done\"}")==RESPONSE_STREAM_NONE);
     }
 }
 
-static void cancellation_checks(void)
-{
-    response_stream_t stream;
-    response_stream_begin(&stream, 10);
-    control(&stream, "{\"type\":\"response.created\",\"response\":{\"id\":\"old_reply\"}}");
-    CHECK(response_stream_accept_audio(&stream, 10));
-    CHECK(response_stream_begin_cancel(&stream));
-    CHECK(!response_stream_accept_audio(&stream, 10));
-    control(&stream, "{\"type\":\"response.created\",\"response\":{\"id\":\"unsolicited\"}}");
-    CHECK(stream.phase == RESPONSE_CANCELLING);
-    proto_msg_t stopped = parse("{\"type\":\"input_audio_buffer.speech_stopped\"}");
-    CHECK(response_stream_starts_turn(&stopped, false, false));
-    CHECK(!response_stream_starts_turn(&stopped, false, true));
-    CHECK(!response_stream_starts_turn(&stopped, true, false));
-    CHECK(!response_stream_cancel_boundary(&stopped));
-    CHECK(response_stream_control(&stream, 10, &stopped) == RESPONSE_STREAM_NONE);
-    CHECK(control(&stream, "{\"type\":\"response.cancelled\",\"response_id\":\"other\"}") == RESPONSE_STREAM_NONE);
-    CHECK(stream.phase == RESPONSE_CANCELLING);
-    CHECK(control(&stream, "{\"type\":\"response.done\",\"response\":{\"id\":\"old_reply\",\"status\":\"cancelled\"}}") == RESPONSE_STREAM_CANCELLED);
-    CHECK(stream.phase == RESPONSE_DISCARD && !response_stream_accept_audio(&stream, 10));
-    control(&stream, "{\"type\":\"response.created\",\"response\":{\"id\":\"late\"}}");
-    CHECK(stream.phase == RESPONSE_DISCARD);
-    response_stream_begin(&stream, 11);
-    CHECK(!response_stream_cancel_done(&stream));
-    CHECK(stream.phase == RESPONSE_WAITING);
-    CHECK(!response_stream_accept_audio(&stream, 10));
-    CHECK(response_stream_accept_audio(&stream, 11));
-    CHECK(!response_stream_cancel_done(&stream));
-    CHECK(stream.phase == RESPONSE_PLAYING);
-    CHECK(response_stream_begin_cancel(&stream));
-    CHECK(control(&stream, "{\"type\":\"response.audio.done\"}") == RESPONSE_STREAM_CANCELLED);
-    CHECK(!response_stream_cancel_done(&stream));
-
-    response_stream_begin(&stream, 12);
-    CHECK(response_stream_begin_cancel(&stream));
-    CHECK(control(&stream, "{\"type\":\"response.done\",\"status\":\"completed\"}") == RESPONSE_STREAM_CANCELLED);
-    response_stream_begin(&stream, 13);
-    CHECK(response_stream_begin_cancel(&stream));
-    CHECK(control(&stream, "{\"type\":\"response.done\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"function_call\"}]}}") == RESPONSE_STREAM_NONE);
-    CHECK(stream.phase == RESPONSE_CANCELLING);
-    response_stream_reset(&stream);
-    CHECK(!response_stream_accept_audio(&stream, 13));
-}
 
 static void failure_checks(void)
 {
@@ -247,60 +176,42 @@ static void failure_checks(void)
     }
 }
 
-static void input_handoff_checks(void)
+
+static void platform_interruption_checks(void)
 {
     response_stream_t stream;
-    response_stream_begin(&stream, 3);
+    response_stream_begin(&stream, 10);
+    control(&stream, "{\"type\":\"response.created\",\"response_id\":\"old\"}");
+    CHECK(response_stream_accept_audio(&stream, 10));
+    response_stream_user_started(&stream);
+    CHECK(stream.phase == RESPONSE_DISCARD && !stream.input_held);
+    CHECK(!response_stream_accept_audio(&stream, 10));
+    CHECK(control(&stream, "{\"type\":\"response.done\",\"response\":{\"id\":\"old\",\"status\":\"cancelled\"}}") == RESPONSE_STREAM_NONE);
+    CHECK(control(&stream, "{\"type\":\"response.created\",\"response_id\":\"old\"}") == RESPONSE_STREAM_NONE);
+    /* 不需要 cancel ack；平台新断句直接开启下一轮。 */
+    response_stream_next_turn(&stream, 11);
     response_stream_hold_input(&stream);
-    /* 用户日志：1792 ms 待补传，18 个 20 ms 包后平台就提前结束输入。
-     * 快速下行不能抢在主任务处理前播放；历史积压只能补传，不能直接取消。 */
-    CHECK(input_handoff_decide(true, true, 16000, 18 * 320, false, false) == INPUT_HANDOFF_DRAIN);
-    CHECK(response_stream_input_held(&stream, 3));
-    CHECK(!response_stream_accept_audio(&stream, 3));
-    CHECK(!response_stream_release_input(&stream, 2)); /* 迟到批准 */
-    control(&stream, "{\"type\":\"response.audio.done\"}");
-    CHECK(!response_stream_finish_if_drained(&stream, true, true, true));
-    CHECK(input_handoff_decide(true, true, 16000, 18 * 320, true, true) == INPUT_HANDOFF_CANCEL);
-    CHECK(response_stream_begin_cancel(&stream));
-    CHECK(!response_stream_input_held(&stream, 3)); /* worker 能继续处理取消边界 */
-    CHECK(!response_stream_accept_audio(&stream, 3));
-    CHECK(control(&stream, "{\"type\":\"response.cancelled\"}") == RESPONSE_STREAM_CANCELLED);
-    CHECK(!response_stream_release_input(&stream, 3));
-
-    response_stream_begin(&stream, 4);
-    response_stream_hold_input(&stream);
-    /* 已上传全部人声，只差预录音中的静音尾部：等待补完，不取消有效回答。 */
-    CHECK(input_handoff_decide(true, true, 16000, 17000, false, false) == INPUT_HANDOFF_DRAIN);
-    CHECK(!response_stream_accept_audio(&stream, 4));
-    CHECK(input_handoff_decide(true, false, 16000, 28800, false, false) == INPUT_HANDOFF_ACCEPT);
-    CHECK(response_stream_release_input(&stream, 4));
-    CHECK(response_stream_accept_audio(&stream, 4));
-    CHECK(!response_stream_accept_audio(&stream, 3));
-    control(&stream, "{\"type\":\"response.audio.done\"}");
-    CHECK(response_stream_finish_if_drained(&stream, true, true, true));
-
-    /* 等交接时新的断句覆盖旧 offer，旧批准/旧音频不准穿过。 */
-    response_stream_begin(&stream, 5);
-    response_stream_hold_input(&stream);
-    response_stream_begin(&stream, 6);
-    response_stream_hold_input(&stream);
-    CHECK(!response_stream_release_input(&stream, 5));
-    CHECK(!response_stream_accept_audio(&stream, 5));
-    CHECK(response_stream_input_held(&stream, 6));
-    response_stream_reset(&stream);
-    CHECK(!response_stream_release_input(&stream, 6));
-
-    CHECK(input_handoff_decide(false, true, 16000, 0, false, false) == INPUT_HANDOFF_ACCEPT);
-    CHECK(input_handoff_decide(true, false, 320, UINT32_MAX - 319, false, false) == INPUT_HANDOFF_DRAIN);
-    CHECK(input_handoff_decide(true, false, UINT32_MAX - 319, 320, false, false) == INPUT_HANDOFF_ACCEPT);
-    barge_in_guard_t guard = {0};
-    for (unsigned i = 0; i < 14; ++i)
-        CHECK(barge_in_guard_feed(&guard, true, 20000, 512,
-              barge_in_guard_age(false, 0)) != BARGE_IN_CONFIRMED);
-    CHECK(barge_in_guard_feed(&guard, true, 20000, 512,
-          barge_in_guard_age(false, 0)) == BARGE_IN_CONFIRMED); /* 不必等喇叭出声 */
-    CHECK(barge_in_guard_feed(&guard, true, 20000, 512,
-          barge_in_guard_age(true, 0)) == BARGE_IN_WAIT_STARTUP); /* 起播保护仍有效 */
+    CHECK(!response_stream_release_input(&stream, 10));
+    CHECK(!response_stream_accept_audio(&stream, 10));
+    CHECK(control(&stream, "{\"type\":\"response.canceled\",\"response_id\":\"old\"}") == RESPONSE_STREAM_NONE);
+    CHECK(control(&stream, "{\"type\":\"response.audio.done\",\"response_id\":\"old\"}") == RESPONSE_STREAM_NONE);
+    CHECK(stream.phase == RESPONSE_WAITING && !stream.audio_eof);
+    CHECK(response_stream_release_input(&stream, 11));
+    control(&stream, "{\"type\":\"response.created\",\"response_id\":\"new\"}");
+    CHECK(response_stream_accept_audio(&stream, 11));
+    CHECK(control(&stream, "{\"type\":\"response.cancelled\",\"response_id\":\"old\"}") == RESPONSE_STREAM_NONE);
+    CHECK(control(&stream, "{\"type\":\"response.done\",\"response\":{\"id\":\"new\",\"status\":\"cancelled\"}}") == RESPONSE_STREAM_CANCELLED);
+    CHECK(!response_stream_accept_audio(&stream, 11));
+    response_stream_next_turn(&stream, 12);
+    CHECK(control(&stream, "{\"type\":\"response.canceled\"}") == RESPONSE_STREAM_NONE);
+    CHECK(stream.phase == RESPONSE_WAITING); /* 无 ID 的旧取消不影响尚未开始的新回答 */
+    proto_msg_t msg = parse("{\"type\":\"conversation.item.input_audio_transcription.started\"}");
+    CHECK(msg.evt == PROTO_EVT_SPEECH_STARTED);
+    msg = parse("{\"type\":\"conversation.item.input_audio_transcription.completed\"}");
+    CHECK(response_stream_starts_turn(&msg, false));
+    CHECK(!response_stream_starts_turn(&msg, true));
+    msg = parse("{\"type\":\"response.output_audio.done\"}");
+    CHECK(msg.evt == PROTO_EVT_RESPONSE_DONE);
 }
 
 int main(void)
@@ -309,9 +220,9 @@ int main(void)
     normal_reply_checks();
     tool_reply_checks();
     tool_audio_fallback_checks();
-    cancellation_checks();
+    platform_interruption_checks();
     failure_checks();
-    input_handoff_checks();
+
     printf("PASS: %u response stream checks (production JSON parser and lifecycle)\n", checks);
     return 0;
 }

@@ -13,18 +13,9 @@ static bool cancelled(const proto_msg_t *msg)
            strcmp(msg->reason, "cancelled") == 0 || strcmp(msg->reason, "canceled") == 0;
 }
 
-bool response_stream_cancel_boundary(const proto_msg_t *msg)
+bool response_stream_starts_turn(const proto_msg_t *msg, bool reminder)
 {
-    return msg->evt == PROTO_EVT_RESPONSE_DONE ||
-        (msg->evt == PROTO_EVT_RESPONSE_TERMINAL &&
-         (cancelled(msg) || (strcmp(msg->status, "completed") == 0 && !msg->has_tool_call)));
-}
-
-bool response_stream_starts_turn(const proto_msg_t *msg, bool reminder, bool cancelling)
-{
-    /* 等待取消确认时，旧语音的迟到 speech_stopped 不能挪动回合号，
-     * 否则随后真正的取消结束事件也会被误判成另一个回合。 */
-    return msg->evt == PROTO_EVT_SPEECH_STOPPED && !reminder && !cancelling;
+    return msg->evt == PROTO_EVT_SPEECH_STOPPED && !reminder;
 }
 
 void response_stream_reset(response_stream_t *stream)
@@ -41,20 +32,30 @@ void response_stream_begin(response_stream_t *stream, uint32_t turn)
     response_expect(&stream->phase);
 }
 
+/* 平台确认用户开始说话后，立即废弃旧输出；没有取消请求/确认等待阶段。 */
 void response_stream_user_started(response_stream_t *stream)
 {
-    /* 已进入下一次用户发言后，旧 response.created 不得重新关闭麦克风。 */
+    stream->phase = RESPONSE_DISCARD;
     stream->continuation_allowed = false;
+    stream->input_held = stream->tool_pending = stream->audio_eof = false;
+}
+
+/* 新用户回合保留最近退役 ID，防止旧终止事件落到尚未收到 created 的新回复。 */
+void response_stream_next_turn(response_stream_t *stream, uint32_t turn)
+{
+    char retired[PROTO_RESPONSE_ID_SIZE];
+    strcpy(retired, stream->response_id[0] ? stream->response_id : stream->retired_id);
+    response_stream_begin(stream, turn);
+    strcpy(stream->retired_id, retired);
 }
 
 bool response_stream_accept_audio(response_stream_t *stream, uint32_t turn)
 {
-    if (stream->input_held || !reply_packet_current(stream->turn, turn) ||
+    if (stream->input_held || stream->audio_eof || !reply_packet_current(stream->turn, turn) ||
         !response_accept_audio(&stream->phase))
         return false;
-    /* V1 不保证发送 created/message；当前回合的 raw Opus 本身也表示工具后续
-     * 语音已开始。仅在接受音频后解除工具等待，旧回合/取消/丢弃均不能走到这里。
-     * 第一段已 EOF 时，继续同一 FIFO 的后续音频，等待本段新的 audio.done。 */
+    /* 每轮只有一个结束边界。audio.done 后只排空已缓存 PCM，迟到二进制
+     * 不能重新开窗；下一次断句或明确的新 response.created 才能开启新输出。 */
     stream->tool_pending = false;
     stream->audio_eof = false;
     return true;
@@ -85,41 +86,38 @@ static bool matches_id(const response_stream_t *stream, const proto_msg_t *msg)
            strcmp(stream->response_id, msg->response_id) == 0;
 }
 
-bool response_stream_cancel_done(response_stream_t *stream)
-{
-    if (stream->phase != RESPONSE_CANCELLING) return false;
-    if (response_finish(&stream->phase) != RESPONSE_END_CANCELLED) return false;
-    stream->continuation_allowed = false;
-    stream->tool_pending = false;
-    stream->audio_eof = false;
-    return true;
-}
-
 response_stream_action_t response_stream_control(response_stream_t *stream, uint32_t turn,
                                                   const proto_msg_t *msg)
 {
     if (!reply_packet_current(stream->turn, turn)) return RESPONSE_STREAM_NONE;
     if (msg->evt == PROTO_EVT_RESPONSE_CREATED) {
-        if (!msg->response_id[0] || stream->phase == RESPONSE_CANCELLING ||
+        if (!msg->response_id[0] ||
             stream->phase == RESPONSE_DISCARD ||
             (!active(stream) && !stream->continuation_allowed) ||
             strcmp(stream->response_id, msg->response_id) == 0 ||
             strcmp(stream->retired_id, msg->response_id) == 0) return RESPONSE_STREAM_NONE;
         bool continued = stream->phase == RESPONSE_IDLE;
-        strcpy(stream->retired_id, stream->response_id);
+        if (stream->response_id[0]) strcpy(stream->retired_id, stream->response_id);
         strcpy(stream->response_id, msg->response_id);
         stream->id_from_created = true;
         stream->tool_pending = stream->audio_eof = false;
         response_expect(&stream->phase);
         return continued ? RESPONSE_STREAM_CONTINUED : RESPONSE_STREAM_NONE;
     }
-    if (!matches_id(stream, msg)) return RESPONSE_STREAM_NONE;
-    if (stream->phase == RESPONSE_CANCELLING) {
-        if (response_stream_cancel_boundary(msg) && response_stream_cancel_done(stream))
-            return RESPONSE_STREAM_CANCELLED;
-        return RESPONSE_STREAM_NONE;
-    }
+    if ((msg->response_id[0] && strcmp(stream->retired_id, msg->response_id) == 0) ||
+        !matches_id(stream, msg)) return RESPONSE_STREAM_NONE;
     if (!active(stream)) return RESPONSE_STREAM_NONE;
+    if (msg->evt == PROTO_EVT_RESPONSE_TERMINAL && cancelled(msg)) {
+        /* 无 ID、无音频的新候选不能被旧 cancelled 消息关闭。平台可直接发
+         * speech_started 中断；有当前 response ID 的主动取消也正常收尾。 */
+        if (stream->phase != RESPONSE_PLAYING && !stream->id_from_created)
+            return RESPONSE_STREAM_NONE;
+        response_stream_user_started(stream);
+        return RESPONSE_STREAM_CANCELLED;
+    }
+    /* 正常结束是关闭窗口，之后的工具/消息事件不能重新接纳同轮迟到音频。
+     * 仅前面的新 created 分支或下一次 speech_stopped 能重新开窗。 */
+    if (stream->audio_eof) return RESPONSE_STREAM_NONE;
     if (msg->evt == PROTO_EVT_RESPONSE_TOOL ||
         (msg->evt == PROTO_EVT_RESPONSE_TERMINAL && msg->has_tool_call)) {
         stream->tool_pending = true;
@@ -134,12 +132,13 @@ response_stream_action_t response_stream_control(response_stream_t *stream, uint
         if (!stream->id_from_created && msg->response_id[0])
             strcpy(stream->response_id, msg->response_id);
         stream->audio_eof = true;
+        stream->tool_pending = false;
         return RESPONSE_STREAM_AUDIO_END;
     }
-    /* failed/incomplete 必须显式恢复；不能让设备无期限闪烁等待语音。
-     * completed 只是阶段完成，既不保证收到音频，也不代表工具链最终完成。 */
+    /* failed/incomplete 结束本轮并回到监听，不自行断开正常连接。
+     * completed 只是阶段完成，正常音频仍以 audio.done 为结束边界。 */
     if (msg->evt == PROTO_EVT_RESPONSE_TERMINAL &&
-        (cancelled(msg) || strcmp(msg->status, "failed") == 0 || strcmp(msg->status, "incomplete") == 0)) {
+        (strcmp(msg->status, "failed") == 0 || strcmp(msg->status, "incomplete") == 0)) {
         stream->phase = RESPONSE_DISCARD;
         stream->continuation_allowed = false;
         return RESPONSE_STREAM_FAILED;
@@ -157,11 +156,4 @@ bool response_stream_finish_if_drained(response_stream_t *stream, bool drained,
     response_finish(&stream->phase);
     stream->audio_eof = false;
     return true;
-}
-
-bool response_stream_begin_cancel(response_stream_t *stream)
-{
-    stream->continuation_allowed = false;
-    stream->input_held = false; /* 放行 worker 丢弃旧音频，继续读取取消确认。 */
-    return response_begin_cancel(&stream->phase);
 }

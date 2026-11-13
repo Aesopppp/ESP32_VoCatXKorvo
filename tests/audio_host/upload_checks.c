@@ -11,13 +11,14 @@
 #define TASK_STACK_AUDIO_IN 4096
 #include <stdio.h>
 #include <stdlib.h>
-#include "../../main/input_handoff.h"
 #include "../../main/audio_in.c"
 
-static unsigned checks, produced, encoded, packets, pause_count, finish_count, failed_events;
+static unsigned checks, produced, encoded, packets, pause_count, failed_events;
 static unsigned fail_packet, stopped_while_paused;
 static bool pause_partial;
 static bool repeat_pause;
+static int64_t test_time_us, last_send_us;
+static unsigned encode_cost_us, send_cost_us, scheduler_late_us;
 static audio_in_handle_t active_input;
 static void (*task_entry)(void *);
 static void *task_argument;
@@ -34,8 +35,8 @@ BaseType_t xSemaphoreGive(SemaphoreHandle_t s) { s->value = 1; return pdTRUE; }
 void vSemaphoreDelete(SemaphoreHandle_t s) { free(s); }
 int xPortGetCoreID(void) { return 1; }
 unsigned uxTaskGetStackHighWaterMark(TaskHandle_t task) { (void)task; return 1024; }
-unsigned esp_log_timestamp(void) { return produced / 16; }
-int64_t esp_timer_get_time(void) { return (int64_t)produced * 1000 / 16; }
+unsigned esp_log_timestamp(void) { return (unsigned)(test_time_us / 1000); }
+int64_t esp_timer_get_time(void) { return test_time_us; }
 void vTaskDelete(TaskHandle_t task) { (void)task; }
 BaseType_t xTaskCreatePinnedToCore(void (*fn)(void *), const char *name, unsigned stack,
     void *arg, unsigned priority, TaskHandle_t *task, unsigned core)
@@ -45,18 +46,16 @@ BaseType_t xTaskCreatePinnedToCore(void (*fn)(void *), const char *name, unsigne
 }
 void vTaskDelay(TickType_t ticks)
 {
-    (void)ticks;
+    test_time_us += (int64_t)ticks * 1000 + scheduler_late_us;
     if (!active_input->paused) return;
     ++pause_count;
     CHECK(active_input->paused_sem->value == 1); /* 上传已停在可恢复边界 */
     CHECK(active_input->pause_ack_epoch == active_input->pause_epoch);
-    CHECK(finish_count == 0 && active_input->preroll.id == 3);
     CHECK(active_input->opus_enc != NULL);
     audio_in_upload_status_t status;
     audio_in_get_upload_status(active_input, &status);
     CHECK(status.sent_end == packets * 320);
-    CHECK(input_handoff_decide(status.running, status.replaying,
-          status.speech_end, status.sent_end, false, false) == INPUT_HANDOFF_DRAIN);
+    CHECK(status.running);
     if (stopped_while_paused) { active_input->running = false; return; }
     size_t partial = active_input->opus_samples;
     if (pause_partial && pause_count == 1) CHECK(partial == 192);
@@ -73,7 +72,10 @@ void vTaskDelay(TickType_t ticks)
 uint32_t ws_service_generation(void) { return 7; }
 esp_err_t ws_service_send_opus_frame(const uint8_t *data, size_t len)
 {
-    (void)data; CHECK(len == 1); ++packets;
+    (void)data; CHECK(len == 1);
+    if (packets) CHECK(test_time_us - last_send_us >= AUDIO_UPLOAD_MIN_INTERVAL_US);
+    last_send_us = test_time_us; ++packets;
+    test_time_us += send_cost_us;
     if (packets == fail_packet) return ESP_ERR_TIMEOUT;
     if (packets == 18 || packets == 35) {
         ++active_input->pause_epoch;
@@ -95,15 +97,12 @@ int opus_enc_encode(opus_enc_handle_t encoder, const int16_t *pcm, int bytes,
 {
     (void)encoder; (void)capacity; CHECK(bytes == 640);
     for (unsigned i = 0; i < 320; ++i) CHECK(pcm[i] == (int16_t)encoded++);
+    test_time_us += encode_cost_us;
     output[0] = 1; return 1;
 }
 int wake_word_get_chunksize(void) { return 512; }
 void wake_word_get_audio_progress(wake_word_audio_progress_t *p)
 { *p = (wake_word_audio_progress_t){29184, produced, 24000}; }
-bool wake_word_get_preroll_info(wake_word_preroll_info_t *p)
-{ *p = (wake_word_preroll_info_t){3, 56, 28672}; return true; }
-size_t wake_word_finish_preroll(uint32_t id)
-{ CHECK(id == 3); ++finish_count; return 0; }
 size_t wake_word_read_audio(int16_t *pcm, size_t capacity, uint32_t *sample_end)
 {
     CHECK(capacity == 1024);
@@ -120,20 +119,20 @@ size_t wake_word_read_audio(int16_t *pcm, size_t capacity, uint32_t *sample_end)
 
 static void run_upload(unsigned failure, bool partial, bool stop)
 {
-    produced = encoded = packets = pause_count = finish_count = failed_events = 0;
+    produced = encoded = packets = pause_count = failed_events = 0;
+    test_time_us = last_send_us = 0;
     fail_packet = failure; pause_partial = partial; stopped_while_paused = stop;
     active_input = audio_in_create(NULL);
     CHECK(active_input != NULL);
     CHECK(audio_in_start_from_ringbuf(active_input, (void *)1) == ESP_OK);
-    CHECK(active_input->replaying); /* 任务还未调度也已保护补传状态 */
     task_entry(task_argument);
     if (!failure && !stop) {
         CHECK(encoded == 29120 && packets == 91);
         CHECK(pause_count == (partial ? 3 : 2) + (repeat_pause ? 1 : 0));
-        CHECK(active_input->preroll.id == 0 && !active_input->replaying);
-        CHECK(active_input->sent_end == encoded && finish_count == 1);
+        CHECK(active_input->sent_end == encoded);
+        /* 约 1.82 秒音频，有限暂停和短调度抖动不能累积成持续录音积压。 */
+        CHECK(test_time_us < (int64_t)packets * AUDIO_UPLOAD_FRAME_US + 200000);
     } else {
-        CHECK(finish_count == 1 && !active_input->replaying);
         CHECK(failed_events == (failure ? 1 : 0));
         if (failure) CHECK(active_input->sent_end == (packets - 1) * 320);
     }
@@ -148,6 +147,9 @@ int main(void)
     repeat_pause = false;
     run_upload(12, false, false);
     run_upload(0, false, true);
-    printf("PASS: %u upload checks (production PCM/Opus packetization, pause/resume, failure/stop)\n", checks);
+    encode_cost_us=6000; send_cost_us=2000; scheduler_late_us=3000;
+    run_upload(0, false, false);
+    run_upload(0, true, false);
+    printf("PASS: %u upload checks (production continuous Opus, 20ms pacing, partial frame retention, send failure)\n", checks);
     return 0;
 }

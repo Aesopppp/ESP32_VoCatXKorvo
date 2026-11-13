@@ -26,16 +26,9 @@
 #include "string.h"
 #include "esp_heap_caps.h"
 #include "freertos/idf_additions.h"
-#include <stdatomic.h>
-#include "barge_in_guard.h"
-#include "audio_preroll_policy.h"
-#include "input_handoff.h"
 #include "esp_timer.h"
 
 static const char *TAG = "wake_word";
-
-_Static_assert(BARGE_IN_SAMPLE_RATE == BSP_I2S_SAMPLE_RATE,
-               "Barge-in timing must match the AFE sample rate");
 
 /* ===========================================================================
  * 全局状态
@@ -72,23 +65,13 @@ static uint32_t s_detect_stack_hiwat = 0;
 /** fetch 帧大小（samples） */
 static int s_afe_chunksize = 0;
 static int s_fetch_chunksize = 0;
-static barge_in_guard_t s_barge_guard;
-static uint32_t s_barge_reject_log_ms;
-static bool s_barge_pending = false;
-static int64_t s_playback_started_ms = 0;
-static bool s_playback_seen = false;
+/* 连续上传只保留短 FIFO；不再冻结 1.5 秒历史或等待取消确认补传。 */
+#define AUDIO_UPLOAD_FIFO_MS 512u
+#define AUDIO_DIAGNOSTIC_ENERGY 2500
 static SemaphoreHandle_t s_audio_buffer_lock;
-static atomic_bool s_barge_reset_requested = false;
-
-/* 以下缓存状态由 s_audio_buffer_lock 保护；检测锁存与缓存保护分别管理。
- * 恢复监听会清除检测锁存，但必须等补传成功后才能解除音频保护。
- */
-static bool s_preroll_protected = false;
-static uint32_t s_preroll_id = 0;
-static size_t s_preroll_dropped_samples = 0;
-static wake_word_audio_progress_t s_audio_progress; /* 同样由缓存锁保护 */
-static input_handoff_speech_t s_handoff_speech;
-static uint32_t s_handoff_id, s_handoff_next_id; /* 缓存锁保护，next 不随清空归零 */
+static wake_word_audio_progress_t s_audio_progress;
+static uint32_t s_overflow_log_ms;
+static uint32_t s_overflow_frames; /* 限频日志之间累计，不能只报最后一次丢帧。 */
 static int32_t afe_frame_energy(const int16_t *pcm, int samples);
 
 static size_t audio_buffer_frames_locked(void)
@@ -108,51 +91,12 @@ static bool discard_oldest_audio_locked(void)
     return true;
 }
 
-/* 清空和模式切换共用此入口，防止恢复新会话时继承旧的缓存保护。调用方持锁。 */
+/* 清空和模式切换共用此入口，复位同一 FIFO 的采样位置。调用方持锁。 */
 static void clear_audio_buffer_locked(void)
 {
     while (discard_oldest_audio_locked()) {}
-    s_preroll_protected = false;
-    s_preroll_dropped_samples = 0;
     memset(&s_audio_progress, 0, sizeof(s_audio_progress));
-    s_handoff_id = 0;
-    input_handoff_speech_reset(&s_handoff_speech);
-}
-
-uint32_t wake_word_watch_input_handoff(void)
-{
-    if (!s_audio_buffer_lock) return 0;
-    xSemaphoreTake(s_audio_buffer_lock, portMAX_DELAY);
-    if (++s_handoff_next_id == 0) ++s_handoff_next_id;
-    uint32_t id = s_handoff_id = s_handoff_next_id;
-    input_handoff_speech_reset(&s_handoff_speech);
-    xSemaphoreGive(s_audio_buffer_lock);
-    return id;
-}
-
-void wake_word_end_input_handoff(uint32_t id)
-{
-    if (!s_audio_buffer_lock) return;
-    xSemaphoreTake(s_audio_buffer_lock, portMAX_DELAY);
-    if (id == s_handoff_id) {
-        s_handoff_id = 0;
-        input_handoff_speech_reset(&s_handoff_speech);
-    }
-    xSemaphoreGive(s_audio_buffer_lock);
-}
-
-bool wake_word_get_input_handoff(uint32_t id, bool *pending, bool *confirmed)
-{
-    *pending = *confirmed = false;
-    if (!s_audio_buffer_lock || !id) return false;
-    xSemaphoreTake(s_audio_buffer_lock, portMAX_DELAY);
-    bool valid = id == s_handoff_id;
-    if (valid) {
-        *pending = s_handoff_speech.guard.samples != 0;
-        *confirmed = s_handoff_speech.confirmed;
-    }
-    xSemaphoreGive(s_audio_buffer_lock);
-    return valid;
+    s_overflow_frames = 0;
 }
 
 void wake_word_get_audio_progress(wake_word_audio_progress_t *progress)
@@ -182,75 +126,50 @@ size_t wake_word_read_audio(int16_t *pcm, size_t capacity, uint32_t *sample_end)
     return bytes;
 }
 
-/* 只在检测任务调用。当前 AFE 每项固定为一个 fetch 帧，队列项数就是 PCM 帧数。
- * 返回非零批次号时，历史音频及当前确认帧已经受保护，可以发布打断事件。
- */
-static uint32_t buffer_afe_audio(const afe_fetch_result_t *res, bool confirm_barge_in)
+/* AEC 后 PCM 在监听和播放时均进入同一 FIFO。网络落后超过 512 ms 时
+ * 丢弃最旧帧并记录诊断，避免数秒旧音频积压后突发补传；此处不判定打断。 */
+static void buffer_afe_audio(const afe_fetch_result_t *res)
 {
-    if (!s_ringbuf || !res->data || res->data_size <= 0) return 0;
+    if (!s_ringbuf || !res->data || res->data_size <= 0) return;
     const size_t frame_bytes = (size_t)s_fetch_chunksize * sizeof(int16_t);
     if ((size_t)res->data_size != frame_bytes) {
         ESP_LOGW(TAG, "Unexpected AFE frame size: %d (expected %u)",
                  res->data_size, (unsigned)frame_bytes);
-        return 0;
+        return;
     }
-
-    uint32_t protected_id = 0;
-    size_t protected_frames = 0;
     xSemaphoreTake(s_audio_buffer_lock, portMAX_DELAY);
-    /* 在锁内重新读取状态，避免已恢复监听却按旧 PLAYING 状态裁剪缓存。 */
-    app_state_t current_state = app_state_get();
-    if (current_state != APP_STATE_LISTENING && current_state != APP_STATE_PLAYING &&
-        current_state != APP_STATE_CANCELLING) {
+    app_state_t current = app_state_get();
+    if (current != APP_STATE_LISTENING && current != APP_STATE_PLAYING) {
         xSemaphoreGive(s_audio_buffer_lock);
-        return 0;
+        return;
     }
-
-    size_t discard = audio_preroll_frames_to_drop(audio_buffer_frames_locked(),
-        s_fetch_chunksize, current_state == APP_STATE_PLAYING, s_preroll_protected);
-    while (discard > 0 && discard_oldest_audio_locked()) --discard;
-
-    if (confirm_barge_in && current_state == APP_STATE_PLAYING && !s_preroll_protected) {
-        s_preroll_protected = true;
-        if (++s_preroll_id == 0) ++s_preroll_id;
-        s_preroll_dropped_samples = 0;
-        protected_id = s_preroll_id;
-    }
-
-    /* 正常监听超载时保留较新的音频；保护期间缓存满时丢新帧并报告，绝不静默删句首。
-     * 现有约 10 秒容量覆盖 1.5 秒预录音 + 最长 8 秒取消等待，无需再分配大缓存。
-     */
-    bool stored = false;
+    size_t dropped = 0;
+    const size_t max_frames = (BSP_I2S_SAMPLE_RATE / 1000u * AUDIO_UPLOAD_FIFO_MS) / s_fetch_chunksize;
+    while (audio_buffer_frames_locked() >= max_frames && discard_oldest_audio_locked())
+        ++dropped;
+    bool stored;
     while (!(stored = xRingbufferSend(s_ringbuf, res->data, frame_bytes, 0) == pdTRUE)) {
-        if (s_preroll_protected) {
-            if (s_preroll_dropped_samples == 0) {
-                ESP_LOGW(TAG, "Barge-in buffer full: preserving prefix, dropping new audio (id=%lu)",
-                         (unsigned long)s_preroll_id);
-            }
-            s_preroll_dropped_samples += s_fetch_chunksize;
-            break;
-        }
         if (!discard_oldest_audio_locked()) break;
+        ++dropped;
     }
     if (stored) {
         s_audio_progress.written_end += s_fetch_chunksize;
-        const int32_t energy = afe_frame_energy(res->data, s_fetch_chunksize);
         if (res->vad_state == VAD_SPEECH &&
-            energy >= BARGE_IN_DIAGNOSTIC_ENERGY)
+            afe_frame_energy(res->data, s_fetch_chunksize) >= AUDIO_DIAGNOSTIC_ENERGY)
             s_audio_progress.speech_end = s_audio_progress.written_end;
-        if (s_handoff_id && current_state == APP_STATE_LISTENING)
-            input_handoff_speech_feed(&s_handoff_speech,
-                res->vad_state == VAD_SPEECH, energy, s_fetch_chunksize);
     }
-    if (protected_id) protected_frames = audio_buffer_frames_locked();
+    s_overflow_frames += dropped;
+    uint32_t now = esp_log_timestamp(), report_dropped = 0;
+    if (s_overflow_frames && (uint32_t)(now - s_overflow_log_ms) >= 2000) {
+        s_overflow_log_ms = now;
+        report_dropped = s_overflow_frames;
+        s_overflow_frames = 0;
+    }
     xSemaphoreGive(s_audio_buffer_lock);
-
-    if (protected_id) {
-        ESP_LOGI(TAG, "Barge-in pre-roll protected: id=%lu frames=%u audio_ms=%u",
-                 (unsigned long)protected_id, (unsigned)protected_frames,
-                 (unsigned)audio_preroll_samples_to_ms(protected_frames * s_fetch_chunksize));
-    }
-    return protected_id;
+    if (report_dropped)
+        ESP_LOGW(TAG, "Microphone FIFO behind: discarded %lu old frames (%lu ms) since last report; keeping live audio",
+                 (unsigned long)report_dropped,
+                 (unsigned long)(report_dropped * s_fetch_chunksize / (BSP_I2S_SAMPLE_RATE / 1000u)));
 }
 
 static int32_t afe_frame_energy(const int16_t *pcm, int samples)
@@ -338,22 +257,6 @@ static void feed_Task(void *arg)
  * detect_Task — AFE fetch → 唤醒词检测
  * ========================================================================= */
 
-static const char *barge_in_result_name(barge_in_result_t result)
-{
-    switch (result) {
-    case BARGE_IN_WAIT_STARTUP:   return "startup_guard";
-    case BARGE_IN_INVALID_FRAME:  return "invalid_frame";
-    case BARGE_IN_WAIT_SPEECH:    return "not_speech";
-    case BARGE_IN_WAIT_ENERGY:    return "low_energy";
-    case BARGE_IN_COLLECTING:     return "collecting";
-    case BARGE_IN_GAP_TOLERATED:  return "short_gap";
-    case BARGE_IN_GAP_EXPIRED:    return "gap_expired";
-    case BARGE_IN_WINDOW_EXPIRED: return "window_expired";
-    case BARGE_IN_CONFIRMED:      return "confirmed";
-    default:                     return "unknown";
-    }
-}
-
 static void detect_Task(void *arg)
 {
     (void)arg;
@@ -368,94 +271,22 @@ static void detect_Task(void *arg)
     }
 
     ESP_LOGI(TAG, "detect_Task started (core %d)", xPortGetCoreID());
-    ESP_LOGI(TAG, "Playback barge-in guard: energy>=%d, speech=%u ms, max_gap=%u ms, "
-             "window=%u ms, startup_guard=%u ms", BARGE_IN_MIN_ENERGY,
-             BARGE_IN_CONFIRM_MS, BARGE_IN_MAX_GAP_MS, BARGE_IN_WINDOW_MS, BARGE_IN_GUARD_MS);
+    ESP_LOGI(TAG, "Platform interruption enabled; local VAD never cancels playback");
 
     while (s_task_running) {
         /* 从 AFE 取回处理结果 */
         afe_fetch_result_t *res = s_afe_iface->fetch(s_afe_data);
-        bool confirm_barge_in = false;
 
         if (res == NULL || res->ret_value == ESP_FAIL) {
-            barge_in_guard_reset(&s_barge_guard);
             ESP_LOGW(TAG, "AFE fetch failed or EOF");
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
 
-        if (atomic_exchange(&s_barge_reset_requested, false)) {
-            barge_in_guard_reset(&s_barge_guard);
-            s_barge_pending = false;
-        }
-
-        /* 仅确认后请求取消。短暂弱音保留候选进度，但不计入有效人声时长；
-         * 未确认前不静音、不暂停、不丢弃播放数据。
-         */
-        if (app_state_get() == APP_STATE_PLAYING) {
-            const bool playing = audio_out_is_streaming();
-            if (!playing) s_playback_seen = false;
-            if (playing && !s_playback_seen) {
-                s_playback_seen = true;
-                s_playback_started_ms = esp_log_timestamp();
-            }
-            const uint32_t now = esp_log_timestamp();
-            /* 等待首包时没有扬声器回声，不必等到起播后才允许用户继续讲话。
-             * 真正开始播放后仍保留原有 1.2 秒回声保护和 480 ms 人声确认。 */
-            const uint32_t playback_age = barge_in_guard_age(playing,
-                now - (uint32_t)s_playback_started_ms);
-            const int samples = res->data && res->data_size > 0
-                                ? res->data_size / sizeof(int16_t) : 0;
-            const int32_t processed_energy = afe_frame_energy(res->data, samples);
-            if (!s_barge_pending) {
-                const bool speech = res->vad_state == VAD_SPEECH;
-                const barge_in_guard_t before = s_barge_guard;
-                const barge_in_result_t result = barge_in_guard_feed(&s_barge_guard,
-                    speech, processed_energy, samples, playback_age);
-                if (result == BARGE_IN_CONFIRMED) {
-                    confirm_barge_in = true;
-                    ESP_LOGI(TAG, "Barge-in confirmed: energy=%ld min=%ld max=%ld "
-                             "speech_ms=%u window_ms=%u gaps_ms=%u",
-                             (long)processed_energy, (long)s_barge_guard.min_energy,
-                             (long)s_barge_guard.max_energy,
-                             (unsigned)barge_in_samples_to_ms(s_barge_guard.samples),
-                             (unsigned)barge_in_samples_to_ms(s_barge_guard.window_samples),
-                             (unsigned)barge_in_samples_to_ms(
-                                 s_barge_guard.window_samples - s_barge_guard.samples));
-                } else if (now - s_barge_reject_log_ms >= 2000 &&
-                           (before.samples || s_barge_guard.samples ||
-                            (speech && processed_energy >= BARGE_IN_DIAGNOSTIC_ENERGY))) {
-                    /* 最多每 2 秒记录一次候选情况，避免逐帧日志影响音频处理。
-                     * 前后计数可区分仍在累计、短隙保留和超限清零；不能据此认定是人声还是回声。
-                     */
-                    s_barge_reject_log_ms = now;
-                    ESP_LOGI(TAG, "Barge-in pending: reason=%s vad=%d energy=%ld "
-                             "speech_ms=%u->%u window_ms=%u->%u gap_ms=%u->%u",
-                             barge_in_result_name(result), (int)speech, (long)processed_energy,
-                             (unsigned)barge_in_samples_to_ms(before.samples),
-                             (unsigned)barge_in_samples_to_ms(s_barge_guard.samples),
-                             (unsigned)barge_in_samples_to_ms(before.window_samples),
-                             (unsigned)barge_in_samples_to_ms(s_barge_guard.window_samples),
-                             (unsigned)barge_in_samples_to_ms(before.gap_samples),
-                             (unsigned)barge_in_samples_to_ms(s_barge_guard.gap_samples));
-                }
-            }
-        } else {
-            barge_in_guard_reset(&s_barge_guard);
-            s_playback_seen = false;
-            s_playback_started_ms = 0;
-            /* Keep the latch until the cancelled response is acknowledged.
-             * Old binary frames can arrive after audio_out_stop(); clearing
-             * it here would retrigger barge-in for the same utterance. */
-        }
-
-        /* VAD state: 0=silence, 1=speech (via AFE 内置 VAD) */
-        // ESP_LOGD(TAG, "vad=%d wake=%d", res->vad_state, res->wakeup_state);
-
         /* ── 唤醒词检测 ── */
         /* B2: only run WakeNet during WAIT_WAKE (CPU saving during LISTENING/PLAYING) */
         /* In LISTENING/PLAYING conversation_active=true,so any hit is discarded by app_main. */
-        /* feed_task / AEC / VAD / barge-in keep running,audio_in and echo cancellation unaffected. */
+        /* feed_task / AEC / VAD keep running; interruption is decided by the platform. */
         if (app_state_get() == APP_STATE_WAIT_WAKE &&
             res->wakeup_state == WAKENET_DETECTED) {
             if (s_wake_state == WAKE_STATE_IDLE) {
@@ -474,16 +305,8 @@ static void detect_Task(void *arg)
             /* 检测到后不再重复触发，直到 reset() */
         }
 
-        /* 先保护历史并追加确认帧，再发布事件。主任务等播放锁或取消确认时仍持续录音。 */
-        uint32_t protected_id = buffer_afe_audio(res, confirm_barge_in);
-        if (protected_id) {
-            s_barge_pending = true;
-            if (event_bus_publish(EV_AUDIO_BARGE_IN, NULL, 0) != pdTRUE) {
-                s_barge_pending = false;
-                wake_word_finish_preroll(protected_id);
-                ESP_LOGW(TAG, "Barge-in event queue full; retrying detection");
-            }
-        }
+        buffer_afe_audio(res);
+
     }
 
     free(fetch_buff);
@@ -711,51 +534,6 @@ RingbufHandle_t wake_word_get_ringbuf(void)
     return s_ringbuf;
 }
 
-void wake_word_protect_preroll(void)
-{
-    if (!s_ringbuf || !s_audio_buffer_lock) return;
-    xSemaphoreTake(s_audio_buffer_lock, portMAX_DELAY);
-    if (!s_preroll_protected && app_state_get() == APP_STATE_PLAYING) {
-        s_preroll_protected = true;
-        if (++s_preroll_id == 0) ++s_preroll_id;
-        s_preroll_dropped_samples = 0;
-    }
-    size_t frames = audio_buffer_frames_locked();
-    xSemaphoreGive(s_audio_buffer_lock);
-    ESP_LOGI(TAG, "Manual interrupt pre-roll: frames=%u audio_ms=%u",
-             (unsigned)frames, (unsigned)audio_preroll_samples_to_ms(frames * s_fetch_chunksize));
-}
-
-bool wake_word_get_preroll_info(wake_word_preroll_info_t *info)
-{
-    if (!info) return false;
-    memset(info, 0, sizeof(*info));
-    if (!s_ringbuf || !s_audio_buffer_lock) return false;
-    xSemaphoreTake(s_audio_buffer_lock, portMAX_DELAY);
-    bool available = s_preroll_protected;
-    if (available) {
-        info->id = s_preroll_id;
-        info->frames = audio_buffer_frames_locked();
-        info->samples = info->frames * s_fetch_chunksize;
-    }
-    xSemaphoreGive(s_audio_buffer_lock);
-    return available;
-}
-
-size_t wake_word_finish_preroll(uint32_t id)
-{
-    if (!s_audio_buffer_lock || !id) return 0;
-    size_t dropped = 0;
-    xSemaphoreTake(s_audio_buffer_lock, portMAX_DELAY);
-    if (id == s_preroll_id && s_preroll_protected) {
-        dropped = s_preroll_dropped_samples;
-        s_preroll_protected = false;
-        s_preroll_dropped_samples = 0;
-    }
-    xSemaphoreGive(s_audio_buffer_lock);
-    return dropped;
-}
-
 int wake_word_get_chunksize(void)
 {
     return s_fetch_chunksize > 0 ? s_fetch_chunksize : 512;
@@ -778,11 +556,6 @@ void wake_word_reset(void)
         ESP_LOGI(TAG, "wake_word_reset: DETECTED → IDLE");
         s_wake_state = WAKE_STATE_IDLE;
     }
-}
-
-void wake_word_reset_barge_in(void)
-{
-    atomic_store(&s_barge_reset_requested, true);
 }
 
 void wake_word_clear_audio_buffer(void)

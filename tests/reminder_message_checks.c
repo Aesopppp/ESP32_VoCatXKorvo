@@ -161,9 +161,9 @@ static void playback_checks(void)
     response_expect(&phase); /* 请求前开放接收门，不需要 speech_stopped */
     CHECK(response_accept_audio(&phase));
     CHECK(!response_playback_finished(phase, true, false));
-    CHECK(response_begin_cancel(&phase));
+    phase = RESPONSE_DISCARD; /* 平台打断直接废弃旧输出，无 cancel/ack。 */
     CHECK(!response_accept_audio(&phase));
-    CHECK(response_finish(&phase) == RESPONSE_END_CANCELLED);
+    CHECK(response_finish(&phase) == RESPONSE_END_IGNORE);
     CHECK(!response_accept_audio(&phase));
 }
 

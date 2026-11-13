@@ -1,6 +1,6 @@
 /** ACOS 回复流生命周期；由 ws_service 的 playback_lock 串行保护。
  * 本地 turn 隔离用户回合，response_id 隔离可识别的模型/工具阶段。
- * 二进制 Opus 无 ID，绝不凭迟到的音频重新打开已取消/已完成的回合。 */
+ * 二进制 Opus 无 ID，绝不凭迟到的音频重新打开已打断/已完成的回合。 */
 #ifndef RESPONSE_STREAM_H
 #define RESPONSE_STREAM_H
 
@@ -15,7 +15,7 @@ typedef struct {
     bool tool_pending;
     bool continuation_allowed;
     bool id_from_created;
-    bool input_held; /* speech_stopped 后，等主任务确认输入交接再播放 */
+    bool input_held; /* speech_stopped 后，等主任务切换 UI 再播放；不停止上传 */
     char response_id[PROTO_RESPONSE_ID_SIZE];
     char retired_id[PROTO_RESPONSE_ID_SIZE];
 } response_stream_t;
@@ -30,6 +30,7 @@ typedef enum {
 
 void response_stream_reset(response_stream_t *stream);
 void response_stream_begin(response_stream_t *stream, uint32_t turn);
+void response_stream_next_turn(response_stream_t *stream, uint32_t turn);
 void response_stream_user_started(response_stream_t *stream);
 bool response_stream_accept_audio(response_stream_t *stream, uint32_t turn);
 void response_stream_hold_input(response_stream_t *stream);
@@ -39,10 +40,7 @@ response_stream_action_t response_stream_control(response_stream_t *stream, uint
                                                   const proto_msg_t *msg);
 bool response_stream_finish_if_drained(response_stream_t *stream, bool drained,
                                        bool queue_empty, bool wire_audio_done);
-bool response_stream_begin_cancel(response_stream_t *stream);
-bool response_stream_cancel_done(response_stream_t *stream);
-/* 仅取消流程可接受 response.done completed；普通播放只由 audio.done 排空。 */
-bool response_stream_cancel_boundary(const proto_msg_t *msg);
-bool response_stream_starts_turn(const proto_msg_t *msg, bool reminder, bool cancelling);
+/* 平台断句创建回合；提醒使用独立入口。 */
+bool response_stream_starts_turn(const proto_msg_t *msg, bool reminder);
 
 #endif

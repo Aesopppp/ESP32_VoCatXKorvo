@@ -26,6 +26,10 @@ dependencies:
   espressif/esp_websocket_client:
     version: "^1.8.0"
 
+  # 新设备协议固定 MQTT 3.1.1；锁定提供原始 SUBACK 数据的客户端版本。
+  espressif/mqtt:
+    version: "1.1.0"
+
   # 显示驱动和纯 C 图形库；版本固定以便复现与验证升级。
   espressif/esp_lcd_st77916:
     version: "2.0.2"

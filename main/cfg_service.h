@@ -37,7 +37,7 @@ typedef enum {
     CFG_KEY_MODEL,
     /* 运行参数 */
     CFG_KEY_VAD_ENABLE,
-    CFG_KEY_BARGE_IN_ENABLE,
+    CFG_KEY_BARGE_IN_ENABLE, /* 旧 NVS 键位保留；平台打断模式不读取此开关。 */
     CFG_KEY_LED_MODE,
     CFG_KEY_VOLUME,
     /* 系统 */

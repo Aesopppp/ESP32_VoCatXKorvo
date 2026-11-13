@@ -9,7 +9,7 @@
 - SDK：ESP-IDF 6.1，ESP32-S3、16 MB Flash，Octal PSRAM 自动识别（本次实板日志为 16 MB）。
 - 硬件参考：已运行过的 XChatbot VoCat v1.2 板级代码与 `BoxAudioCodec`；未引入其 C++ 应用框架。
 
-本版保留 YMOS 的 C 服务结构、事件总线、WebSocket 鉴权与语音协议、连续对话、打断、句首预录音、NVS 和本地网页配网。按最新要求，**不启动 MQTT、不接入远程定时提醒**，也未合入另一个 YMOS 工作目录中新加的设备 HTTP 握手。
+本版保留 YMOS 的 C 服务结构、事件总线、WebSocket 语音协议、连续对话、打断、句首预录音、NVS 和本地网页配网。初次移植未启动 MQTT。2026-11-09 增加可选设备 HTTP 握手及动态语音凭据：启用后使用下发的 URL/token，建连前检查有效期，失败不回退到旧 key，见 [HTTP 握手与语音鉴权](device-http-handshake.md)。2026-11-10 新增 [设备 MQTT 接入](device-mqtt.md)，使用新版设备协议；需提供平台 CA，语音请求协议未确定前只实现任务接收与后续播放入口，不默认播放提醒。
 
 后续增加了 ST77916 屏幕、CST816S 触摸和设置菜单，详见 [屏幕与触屏](vocat-screen-menu.md)。未初始化完整动画资源、SD 卡、IMU 或电量计。`led_service` 只保留逻辑状态接口；屏幕和串口用于观察状态。旧 Korvo 的红/绿灯和 ADC 按键不适用于此板。
 

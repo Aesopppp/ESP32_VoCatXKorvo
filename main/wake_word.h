@@ -114,32 +114,11 @@ typedef struct {
     uint32_t speech_end;
 } wake_word_audio_progress_t;
 void wake_word_get_audio_progress(wake_word_audio_progress_t *progress);
-/** 主任务在本轮回答候选到达后开始观察；只计新 AFE 帧，不重新处理 FIFO。
- * 返回非零观察代次，结束/查询需同一代次；缓存复位会使旧观察失效。 */
-uint32_t wake_word_watch_input_handoff(void);
-void wake_word_end_input_handoff(uint32_t id);
-bool wake_word_get_input_handoff(uint32_t id, bool *pending, bool *confirmed);
 /** audio_in 唯一消费者：非阻塞复制一帧并归还项，返回字节数及末端采样位置。
  * 返回 0 表示无帧；返回值大于 capacity 时未复制，消费者必须报错。 */
 size_t wake_word_read_audio(int16_t *pcm, size_t capacity, uint32_t *sample_end);
 /** Flush stale PCM with the upload task stopped. */
 void wake_word_clear_audio_buffer(void);
-
-/** 打断缓存快照；frames/samples 是启动补传前仍未读取的真实音频量。 */
-typedef struct {
-    uint32_t id;
-    size_t frames;
-    size_t samples;
-} wake_word_preroll_info_t;
-
-/** 仅由 audio_in 在开始读 ring buffer 前调用，获取本次需补传的 FIFO 前缀。 */
-bool wake_word_get_preroll_info(wake_word_preroll_info_t *info);
-
-/** 主任务手动打断前调用；在同一缓存锁下保护历史，沿用语音打断的补传流程。 */
-void wake_word_protect_preroll(void);
-
-/** 补传完成或中止时解除对应批次保护，返回保护期间因容量不足丢弃的新采样数。 */
-size_t wake_word_finish_preroll(uint32_t id);
 
 /**
  * @brief 获取 AFE fetch 帧大小（samples）
@@ -168,8 +147,6 @@ void wake_word_set_callback(wake_word_detected_cb_t cb, void *user_data);
  */
 void wake_word_reset(void);
 
-/** Clear the one-shot barge-in latch after the cancelled response is done. */
-void wake_word_reset_barge_in(void);
 
 /**
  * @brief 获取 feed_Task 栈高水位（调试用）

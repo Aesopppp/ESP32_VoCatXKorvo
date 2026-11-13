@@ -18,7 +18,7 @@
 #include "wake_word.h"
 #include "ws_service.h"
 #include "opus_codec.h"
-#include "audio_preroll_policy.h"
+#include "audio_upload_policy.h"
 #include "esp_log.h"
 #include "esp_err.h"
 #include "freertos/FreeRTOS.h"
@@ -27,6 +27,10 @@
 #include <stdatomic.h>
 
 static const char *TAG = "audio_in";
+/* 编码放到 core 0，优先级低于 AFE feed(5)；core 1 留给解码和 PCM 输出。
+ * 不改变 AFE/Wi-Fi/lwIP 的绑定，避免全双工时编码、解码串在同一核心。 */
+#define AUDIO_UPLOAD_CORE 0
+#define AUDIO_UPLOAD_PRIORITY 4
 
 /** 全局句柄（供 app_state.c 启动时使用） */
 static audio_in_handle_t s_audio_handle = NULL;
@@ -61,10 +65,10 @@ struct audio_in_impl {
     int16_t                  opus_pcm[320];
     size_t                   opus_samples;
 
-    /* 打断补传只统计成功发给 WebSocket 的 Opus 包，不把“读出缓存”当作上传成功。 */
-    wake_word_preroll_info_t  preroll;
-    size_t                   preroll_packets;
-    atomic_bool              replaying;
+    /* 连续上传：20 ms 节拍，不在播放/平台打断之间重启编码器。 */
+    audio_upload_clock_t     upload_clock;
+    int64_t                  stats_at;
+    uint32_t                 stats_packets, encode_max_us, send_max_us, late_max_us;
     uint32_t                 sent_end; /* h->lock 保护，成功发送后才推进 */
 
     /* 任务 */
@@ -210,28 +214,11 @@ static void fail_audio_upload(audio_in_handle_t h, esp_err_t err)
     event_bus_publish(EV_AUDIO_UPLOAD_FAILED, (void *)(uintptr_t)h->connection_generation, 0);
 }
 
-static void account_preroll_packet(audio_in_handle_t h)
-{
-    if (!h->preroll.id) return;
-    ++h->preroll_packets;
-    /* PCM 帧为 32 ms、Opus 包为 20 ms，最后一包可能同时包含缓存尾部和实时音频。
-     * 以成功发送的采样数跨过快照边界为准，不要求两种帧大小整除。
-     */
-    if (h->preroll_packets * 320u < h->preroll.samples) return;
-    size_t dropped = wake_word_finish_preroll(h->preroll.id);
-    ESP_LOGI(TAG, "Barge-in replay sent: id=%lu audio_ms=%u opus_frames=%u dropped_ms=%u",
-             (unsigned long)h->preroll.id,
-             (unsigned)audio_preroll_samples_to_ms(h->preroll.samples),
-             (unsigned)h->preroll_packets, (unsigned)audio_preroll_samples_to_ms(dropped));
-    h->preroll.id = 0;
-    atomic_store(&h->replaying, false);
-}
-
 /* 暂停发生在消费下一采样前，不丢当前帧余量。不得在持缓存锁/播放锁时等待。 */
 static bool wait_upload_enabled(audio_in_handle_t h)
 {
     while (h->running && atomic_load(&h->paused)) {
-        /* 连续取消可能在任务尚未离开旧暂停循环前又要求暂停；每次请求都单独
+        /* 连续暂停可能在任务尚未离开旧暂停循环前再次请求；每次请求都单独
          * 确认，不能消费上一次信号后误认为本次网络发送已经结束。 */
         atomic_store(&h->pause_ack_epoch, atomic_load(&h->pause_epoch));
         xSemaphoreGive(h->paused_sem);
@@ -265,24 +252,54 @@ static void encode_and_send(audio_in_handle_t h, const int16_t *pcm, size_t pcm_
         if (!wait_upload_enabled(h)) break;
         h->opus_pcm[h->opus_samples++] = pcm[i];
         if (h->opus_samples == 320) {
+            int64_t encode_at = esp_timer_get_time();
             int opus_len = opus_enc_encode(h->opus_enc, h->opus_pcm, sizeof(h->opus_pcm), opus_out, sizeof(opus_out));
+            uint32_t encode_us = (uint32_t)(esp_timer_get_time() - encode_at);
+            if (encode_us > h->encode_max_us) h->encode_max_us = encode_us;
             if (opus_len > 0) {
+                int64_t wait_us = audio_upload_deadline(&h->upload_clock) - esp_timer_get_time();
+                if (wait_us > 0) vTaskDelay(pdMS_TO_TICKS((wait_us + 999) / 1000));
+                if (!wait_upload_enabled(h)) break;
+                int64_t sent_at = esp_timer_get_time();
+                int64_t late = h->upload_clock.started ? sent_at - h->upload_clock.next_us : 0;
+                if (late > h->late_max_us) h->late_max_us = (uint32_t)late;
                 esp_err_t err = ws_service_send_opus_frame(opus_out, opus_len);
+                uint32_t send_us = (uint32_t)(esp_timer_get_time() - sent_at);
+                if (send_us > h->send_max_us) h->send_max_us = send_us;
                 if (err == ESP_OK) {
+                    audio_upload_advance(&h->upload_clock, sent_at);
+                    ++h->stats_packets;
                     xSemaphoreTake(h->lock, portMAX_DELAY);
                     h->sent_end = sample_start + i + 1;
                     xSemaphoreGive(h->lock);
-                    account_preroll_packet(h);
                 }
                 else fail_audio_upload(h, err);
             } else {
-                /* 编码失败不能跳过一句话中的采样后继续报告“完整补传”。 */
+                /* 编码失败交给主任务恢复，不能静默跳过一句话中的采样。 */
                 ESP_LOGW(TAG, "Opus encode failed: %d", opus_len);
                 fail_audio_upload(h, ESP_FAIL);
             }
             h->opus_samples = 0;
         }
     }
+}
+
+/* 每 5 秒在上传任务中采样；耗时是包含抢占的墙钟时间，不是纯 CPU 时间。 */
+static void log_upload_stats(audio_in_handle_t h)
+{
+    int64_t now = esp_timer_get_time();
+    if (now - h->stats_at < 5000000) return;
+    wake_word_audio_progress_t progress;
+    wake_word_get_audio_progress(&progress);
+    ESP_LOGI(TAG, "Upload stats: window_ms=%lu packets=%lu audio_ms=%lu fifo_ms=%lu "
+             "encode_max_us=%lu send_max_us=%lu late_max_us=%lu",
+             (unsigned long)((now - h->stats_at) / 1000), (unsigned long)h->stats_packets,
+             (unsigned long)(h->stats_packets * 20),
+             (unsigned long)((uint32_t)(progress.written_end - progress.read_end) / 16),
+             (unsigned long)h->encode_max_us, (unsigned long)h->send_max_us,
+             (unsigned long)h->late_max_us);
+    h->stats_at = now;
+    h->stats_packets = h->encode_max_us = h->send_max_us = h->late_max_us = 0;
 }
 
 /* ===========================================================================
@@ -305,13 +322,6 @@ static void audio_in_task(void *param)
 
     ESP_LOGI(TAG, "audio_in task started (ringbuf, chunksize=%d, core %d)",
              wake_word_get_chunksize(), xPortGetCoreID());
-
-    h->preroll_packets = 0;
-    if (h->preroll.id) {
-        ESP_LOGI(TAG, "Barge-in replay start: id=%lu pcm_frames=%u audio_ms=%u",
-                 (unsigned long)h->preroll.id, (unsigned)h->preroll.frames,
-                 (unsigned)audio_preroll_samples_to_ms(h->preroll.samples));
-    }
 
     while (h->running) {
         if (!wait_upload_enabled(h)) break;
@@ -340,17 +350,9 @@ static void audio_in_task(void *param)
 
         /* VAD */
         if (h->running) process_vad_frame(h, frame_buf, samples_read, ts);
+        log_upload_stats(h);
     }
 
-    if (h->preroll.id) {
-        size_t dropped = wake_word_finish_preroll(h->preroll.id);
-        ESP_LOGW(TAG, "Barge-in replay incomplete: id=%lu sent_opus_frames=%u target_ms=%u dropped_ms=%u",
-                 (unsigned long)h->preroll.id, (unsigned)h->preroll_packets,
-                 (unsigned)audio_preroll_samples_to_ms(h->preroll.samples),
-                 (unsigned)audio_preroll_samples_to_ms(dropped));
-        h->preroll.id = 0;
-    }
-    atomic_store(&h->replaying, false);
     free(frame_buf);
     ESP_LOGI(TAG, "audio_in task exited");
     /* 通知 audio_in_stop() 任务已退出；不能使用 xTaskNotifyGive(NULL)，
@@ -464,7 +466,9 @@ esp_err_t audio_in_start_from_ringbuf(audio_in_handle_t h, RingbufHandle_t ringb
     xSemaphoreTake(h->lock, portMAX_DELAY);
     h->sent_end = progress.read_end;
     xSemaphoreGive(h->lock);
-    atomic_store(&h->replaying, wake_word_get_preroll_info(&h->preroll));
+    memset(&h->upload_clock, 0, sizeof(h->upload_clock));
+    h->stats_at = esp_timer_get_time();
+    h->stats_packets = h->encode_max_us = h->send_max_us = h->late_max_us = 0;
     /* 清除上一次任务的完成信号，再创建新任务。 */
     xSemaphoreTake(h->done_sem, 0);
 
@@ -474,7 +478,7 @@ esp_err_t audio_in_start_from_ringbuf(audio_in_handle_t h, RingbufHandle_t ringb
     BaseType_t ret = xTaskCreatePinnedToCore(
         audio_in_task, "audio_in",
         TASK_STACK_AUDIO_IN,
-        h, 5, &h->task_h, 1);   /* core 1，与 detect_Task 同一核，共享 L2 */
+        h, AUDIO_UPLOAD_PRIORITY, &h->task_h, AUDIO_UPLOAD_CORE);
     if (ret != pdPASS) {
         h->running = false;
         h->task_h = NULL;
@@ -508,7 +512,6 @@ void audio_in_get_upload_status(audio_in_handle_t h, audio_in_upload_status_t *s
     wake_word_get_audio_progress(&progress);
     status->speech_end = progress.speech_end;
     status->running = h->running;
-    status->replaying = atomic_load(&h->replaying);
     xSemaphoreTake(h->lock, portMAX_DELAY);
     status->sent_end = h->sent_end;
     xSemaphoreGive(h->lock);

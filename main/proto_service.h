@@ -85,6 +85,18 @@ typedef struct {
 
 /* ---- Public API --------------------------------------------------------- */
 
+/* HTTP 下发和 WS 发送共用长度上限；凭据以字节计，不允许静默截短。 */
+#define PROTO_WS_URL_MAX 1024
+#define PROTO_AUTH_TOKEN_MAX 2048
+#define PROTO_AUTH_FRAME_SIZE (PROTO_AUTH_TOKEN_MAX * 6 + 32)
+typedef struct {
+    char url[PROTO_WS_URL_MAX + 1];
+    char token[PROTO_AUTH_TOKEN_MAX + 1];
+} proto_ws_credentials_t;
+
+/* 仅识别已知鉴权错误码，不根据可能包含业务正文的 message 猜测。 */
+bool proto_is_auth_error(const proto_msg_t *msg);
+
 /**
  * @brief Parse one JSON text frame into msg.
  * @param json_str NUL-terminated JSON string.
@@ -106,7 +118,7 @@ void proto_msg_clear(proto_msg_t *msg);
  *
  * @param buf       output buffer
  * @param buf_size  buffer size
- * @param token     API Key (sk-...)
+ * @param token     网关下发的 token；仅旧配置模式使用静态 API Key
  * @return          length written (>=0), 0 on failure
  */
 size_t proto_build_auth_frame(char *buf, size_t buf_size, const char *token);

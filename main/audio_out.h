@@ -34,7 +34,7 @@ esp_err_t audio_out_read_afe_input(int16_t *pcm, size_t bytes);
 /* true begins an idempotent stream; false seals it and drains a short final reply
  * even if its PCM never reached the prefill threshold. */
 void audio_out_set_streaming(bool active);
-/* Audible playback (including a temporary starvation); used by barge-in guard. */
+/* Audible playback (including a temporary starvation); used by UI/diagnostics. */
 bool audio_out_is_streaming(void);
 bool audio_out_is_drained(void);
 /* Enqueue 16 kHz mono signed 16-bit PCM. Length is bytes. Bounded backpressure. */
@@ -43,6 +43,9 @@ esp_err_t audio_out_write(const int16_t *pcm_data, size_t pcm_len);
 int audio_out_play_opus(const uint8_t *opus_data, size_t opus_len);
 /* Discard queued PCM, ramp to silence and overwrite the TX DMA horizon. */
 esp_err_t audio_out_stop(void);
+/* 平台信号快速通道：仅写原子标志，解除 PCM 写入等待；不在回调内操作 I2S。 */
+void audio_out_request_stop(void);
+bool audio_out_stop_requested(void);
 esp_err_t audio_out_clear_queue(void);
 audio_out_state_t audio_out_get_state(void);
 void audio_out_set_event_cb(audio_out_event_cb_t cb, void *arg);

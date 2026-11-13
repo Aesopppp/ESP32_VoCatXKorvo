@@ -271,7 +271,8 @@ static void on_event_bus(event_t *event, void *user_data)
         case EV_AUDIO_OUT_START:
             led_service_playing(svc);
             break;
-        case EV_AUDIO_BARGE_IN:
+        case EV_WS_SPEECH_STARTED:
+        case EV_WS_RESPONSE_INTERRUPTED:
             led_service_recording(svc);
             break;
         case EV_SYSTEM_ERROR:
@@ -291,7 +292,7 @@ void led_service_register_events(led_service_t svc)
         EV_WS_AUTH_OK, EV_WS_DISCONNECTED, EV_WS_ERROR,
         EV_SYSTEM_WIFI_DISCONNECTED,
         EV_AUDIO_SPEECH_START, EV_AUDIO_SPEECH_END,
-        EV_AUDIO_OUT_START, EV_AUDIO_BARGE_IN,
+        EV_AUDIO_OUT_START, EV_WS_SPEECH_STARTED, EV_WS_RESPONSE_INTERRUPTED,
         EV_SYSTEM_ERROR,
     };
 

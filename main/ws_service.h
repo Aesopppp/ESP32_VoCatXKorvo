@@ -8,14 +8,15 @@
  *     - Upload: Opus frames -> Base64 -> `input_audio_buffer.append` text frames.
  *     - Download: raw Opus binary frames -> decode -> audio_out_play_opus().
  *     - Server events: speech_started / speech_stopped / response.audio.done / error.
- *     - Barge-In: speech_started triggers audio_out_stop() (caller clears queue).
+ *     - Platform interruption: speech_started invalidates old RX audio; worker stops output.
  *
  *   Spec target:
  *     WSS://acos-platform.emicloud.com/acos-realtime
  *     (overridable via CFG_KEY_WS_URL or NVS)
  *
  *   Thread-safety:
- *     All public APIs are safe to call from main / FreeRTOS tasks.
+ *     Lifecycle/configuration/auth APIs are serialized by main_task.
+ *     Audio upload APIs may run in the existing audio task.
  *     WebSocket events are dispatched via esp_websocket event handler
  *     (runs inside esp_websocket_client internal task) and forwarded to
  *     app_event_queue / event_bus.
@@ -65,6 +66,11 @@ typedef struct {
 
 /* ---- Public API -------------------------------------------------------- */
 esp_err_t ws_service_init(void);
+/* 主任务先 disconnect，再设置本次连接的 URL/token，最后 connect。
+ * 非 NULL 输入被整组复制，最长长度见 proto_service.h；不借用 HTTP 快照。
+ * 两参数均 NULL 才读取旧 NVS 配置，调用者仅在握手显式关闭时允许这样做。
+ * 生命周期调用之间不会自动回退到旧配置，不写入 NVS。 */
+esp_err_t ws_service_set_credentials(const char *url, const char *token);
 esp_err_t ws_service_connect(void);
 esp_err_t ws_service_disconnect(void);
 esp_err_t ws_service_deinit(void);
@@ -79,11 +85,12 @@ esp_err_t ws_service_deinit(void);
  * @return ESP_OK on enqueue; ESP_ERR_INVALID_STATE if WS not CONNECTED.
  */
 esp_err_t ws_service_send_opus_frame(const uint8_t *opus_data, size_t opus_len);
-esp_err_t ws_service_cancel_response(void);
+/* 只读当前回复阶段，避免 UI 消费迟到事件后覆盖新回合。 */
+bool ws_service_reply_interrupted(void);
+bool ws_service_reply_finished(void);
 /** Main-task-only lifecycle APIs. RX callbacks never wait for audio tasks. */
 esp_err_t ws_service_authenticate(void);
 uint32_t ws_service_generation(void);
-void ws_service_log_cancel_wait(void);
 /** 主任务超时诊断：仅记录回复阶段/音频计数，不输出请求正文。 */
 void ws_service_log_response_wait(void);
 

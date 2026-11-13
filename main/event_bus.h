@@ -28,7 +28,8 @@ typedef enum {
     EV_WS_ERROR             = 5,
     EV_WS_AUTH_OK           = 6,
     EV_WS_SERVER_ERROR      = 7,
-    EV_WS_CANCEL_DONE       = 8,
+    EV_WS_RESPONSE_INTERRUPTED       = 8,
+    EV_WS_AUTH_FAILED       = 9, /* 鉴权拒绝单独处理，避免用同一失效 key 无限重连。 */
     EV_WS_SPEECH_STARTED    = 40,
     EV_WS_SPEECH_STOPPED    = 41,
     EV_WS_RESPONSE_DONE     = 42,
@@ -45,7 +46,7 @@ typedef enum {
     EV_AUDIO_OUT_READY      = 24,
     EV_AUDIO_OUT_START      = 25,
     EVENT_BUS_WIFI_STATE    = 30,
-    EV_AUDIO_BARGE_IN       = 23,
+    /* 23 保留：原本地自动打断事件已停用。 */
     EV_SYSTEM_SHUTDOWN      = 100,
     EV_SYSTEM_ERROR         = 101,
     EV_MQTT_CONNECTED       = 50,

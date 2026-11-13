@@ -30,6 +30,8 @@ static atomic_int output_volume;
 static audio_out_event_cb_t callback;
 static void *callback_arg;
 static atomic_bool playback_streaming;
+/* 网络回调仅设置原子标志；worker 负责真正清队列和刷新 DMA。 */
+static atomic_bool stop_requested;
 static TaskHandle_t playback_task;
 static atomic_bool task_exit, task_exited;
 static int16_t pcm_ring[PCM_CAPACITY], decode_pcm[1920];
@@ -38,6 +40,7 @@ static bool stream_open, stream_eof, stream_drained = true, output_started;
 static unsigned drain_blocks, fade_samples;
 static int16_t last_sample;
 static uint32_t underruns, supplied_samples, decoded_packets, decode_max_us, write_max_us;
+static uint32_t decode_total_us, decode_samples, decode_over_budget;
 static int64_t stats_at;
 static void playback_worker(void *arg);
 
@@ -202,13 +205,13 @@ static void playback_worker(void *arg)
     while(!atomic_load(&task_exit)) {
         int16_t mono[PCM_BLOCK]={0};
         xSemaphoreTake(output_lock,portMAX_DELAY);
-        if(stream_open && !output_started && pcm_can_start(pcm_count,stream_eof)) {
+        if(stream_open && !atomic_load(&stop_requested) && !output_started && pcm_can_start(pcm_count,stream_eof)) {
             output_started=true;
             fade_samples=80; /* 5 ms onset ramp */
             atomic_store(&playback_streaming,true);
             event_bus_publish(EV_AUDIO_OUT_START,NULL,0);
         }
-        size_t n=output_started ? pcm_take_count(pcm_count) : 0;
+        size_t n=output_started && !atomic_load(&stop_requested) ? pcm_take_count(pcm_count) : 0;
         for(size_t i=0;i<n;++i) {
             mono[i]=pcm_ring[pcm_read]; pcm_read=(pcm_read+1)%PCM_CAPACITY;
             if(fade_samples) { mono[i]=pcm_scale(mono[i],80-fade_samples,80); --fade_samples; }
@@ -236,10 +239,16 @@ static void playback_worker(void *arg)
         bool report=stream_open && now-stats_at>=5000000;
         size_t buffered=pcm_count;
         uint32_t gaps=underruns, dec=decode_max_us, wr=write_max_us, samples=supplied_samples;
-        if(report) { stats_at=now; decode_max_us=write_max_us=0; }
+        uint32_t dec_total=decode_total_us, dec_audio=decode_samples, dec_slow=decode_over_budget;
+        if(report) {
+            stats_at=now; decode_max_us=write_max_us=0;
+            decode_total_us=decode_samples=decode_over_budget=0;
+        }
         xSemaphoreGive(output_lock);
-        if(report) ESP_LOGI("audio_out", "Playback stats: buffered_ms=%u starvations=%lu decode_max_us=%lu write_max_us=%lu pcm_ms=%lu",
-            (unsigned)(buffered/16),(unsigned long)gaps,(unsigned long)dec,(unsigned long)wr,(unsigned long)(samples/16));
+        if(report) ESP_LOGI("audio_out", "Playback stats: buffered_ms=%u starvations=%lu decode_max_us=%lu write_max_us=%lu pcm_ms=%lu "
+            "decode_work_ms=%lu decode_audio_ms=%lu decode_slow=%lu",
+            (unsigned)(buffered/16),(unsigned long)gaps,(unsigned long)dec,(unsigned long)wr,(unsigned long)(samples/16),
+            (unsigned long)(dec_total/1000),(unsigned long)(dec_audio/16),(unsigned long)dec_slow);
         if(err!=ESP_OK) { event_bus_publish(EV_AUDIO_INPUT_ERROR,NULL,0); vTaskDelay(pdMS_TO_TICKS(20)); }
         /* Fairness between blocks even if DMA has several free descriptors. */
         vTaskDelay(1);
@@ -258,7 +267,7 @@ esp_err_t audio_out_write(const int16_t *pcm_data,size_t pcm_len)
     int64_t deadline=esp_timer_get_time()+2000000;
     while(pos<total) {
         xSemaphoreTake(output_lock,portMAX_DELAY);
-        if(!stream_open || stream_eof || state==AUDIO_OUT_STATE_ERROR) {
+        if(atomic_load(&stop_requested) || !stream_open || stream_eof || state==AUDIO_OUT_STATE_ERROR) {
             xSemaphoreGive(output_lock); return ESP_ERR_INVALID_STATE;
         }
         while(pos<total && pcm_count<PCM_CAPACITY) {
@@ -283,6 +292,7 @@ void audio_out_set_streaming(bool active)
         pcm_read=pcm_write=pcm_count=0;
         stream_open=true; stream_eof=false; stream_drained=false; output_started=false;
         drain_blocks=0; underruns=supplied_samples=decoded_packets=decode_max_us=write_max_us=0;
+        decode_total_us=decode_samples=decode_over_budget=0;
         stats_at=esp_timer_get_time(); state=AUDIO_OUT_STATE_PLAYING;
     } else if(active && stream_eof) {
         /* 同一回复的下一音频段：撤销 EOF，保留尚未播出的 PCM 和 DMA 尾音。
@@ -309,6 +319,11 @@ int audio_out_play_opus(const uint8_t *data,size_t len)
     uint32_t elapsed=(uint32_t)(esp_timer_get_time()-start);
     xSemaphoreTake(output_lock,portMAX_DELAY);
     if(elapsed>decode_max_us) decode_max_us=elapsed;
+    decode_total_us+=elapsed;
+    if(samples>0) {
+        decode_samples+=(uint32_t)samples;
+        if(elapsed>(uint32_t)samples*1000000u/AUDIO_OUT_SAMPLE_RATE) ++decode_over_budget;
+    }
     ++decoded_packets;
     xSemaphoreGive(output_lock);
     if(samples>0 && audio_out_write(decode_pcm,samples*sizeof(int16_t))!=ESP_OK) return -1;
@@ -317,7 +332,9 @@ int audio_out_play_opus(const uint8_t *data,size_t len)
 esp_err_t audio_out_stop(void)
 {
     if(!output_lock) return ESP_ERR_INVALID_STATE;
+    /* 在清理开始时消费请求，清理期间到达的新请求留给下一次 worker。 */
     xSemaphoreTake(output_lock,portMAX_DELAY);
+    atomic_store(&stop_requested,false);
     pcm_read=pcm_write=pcm_count=0;
     stream_open=false; stream_eof=false; output_started=false;
     atomic_store(&playback_streaming,false);
@@ -333,6 +350,8 @@ esp_err_t audio_out_stop(void)
     xSemaphoreGive(output_lock);
     return err;
 }
+void audio_out_request_stop(void) { atomic_store(&stop_requested,true); }
+bool audio_out_stop_requested(void) { return atomic_load(&stop_requested); }
 esp_err_t audio_out_clear_queue(void) { return audio_out_stop(); }
 audio_out_state_t audio_out_get_state(void) { return atomic_load(&state); }
 void audio_out_set_event_cb(audio_out_event_cb_t cb,void *arg) {callback=cb;callback_arg=arg;}

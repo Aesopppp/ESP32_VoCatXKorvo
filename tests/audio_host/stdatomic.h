@@ -7,3 +7,5 @@ typedef unsigned atomic_uint;
 #define atomic_load(p) (*(p))
 #define atomic_store(p, v) ((*(p)) = (v))
 #define atomic_fetch_add(p, v) ((*(p) += (v)) - (v))
+static inline unsigned atomic_exchange(atomic_uint *p, unsigned value)
+{ unsigned previous = *p; *p = value; return previous; }

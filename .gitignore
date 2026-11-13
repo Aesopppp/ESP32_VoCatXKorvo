@@ -15,3 +15,5 @@ __pycache__/
 /main/wifi_local_config.h
 /main/acos_local_config.h
 /main/acos_reminder_local_config.h
+/main/device_handshake_local_config.h
+/main/device_mqtt_local_config.h
