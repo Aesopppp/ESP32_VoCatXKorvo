@@ -70,6 +70,15 @@ esp_err_t wifi_service_connect(const char *ssid, const char *password,
 esp_err_t wifi_service_disconnect(void);
 
 /**
+ * @brief 连续音频上传期间关闭 modem sleep，停止后恢复默认省电模式。
+ *
+ * 由唯一的 audio_in 实例在主任务的 start/stop 中调用，不是引用计数接口。
+ * 未关联 AP 时只保存意图，重连成功后重新应用；不写 NVS、不改变连接策略。
+ * 应用失败返回错误并记录日志，调用方可继续音频，不据此重建会话。
+ */
+esp_err_t wifi_service_set_audio_active(bool active);
+
+/**
  * @brief 获取当前 Wi-Fi 状态
  */
 wifi_state_t wifi_service_get_state(void);

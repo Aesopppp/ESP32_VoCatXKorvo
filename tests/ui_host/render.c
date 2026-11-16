@@ -154,6 +154,8 @@ static void animation_checks(bool export_frames) {
   s_state.status=states[s]; set_page(UI_PAGE_HOME); finish_page_slide(); mock_time_ms+=5000;
   render(); lv_refr_now(mock_display);
   uint32_t first=frame_hash(); bool changed=false;
+  unsigned submissions=frame_submissions;
+  if(!missing_assets) { char path[100]; snprintf(path,sizeof(path),"work/ui-checks/%s.ppm",names[s]); dump_frame(path); }
   for(unsigned f=0;f<100;++f) {
    /* 模拟取消确认到达：从 cancelling 转为 listening，画面应延续而非重播首帧。 */
    ui_status_t status=states[s]==UI_STATUS_CANCELLING && f>=40 ? UI_STATUS_LISTENING : s_state.status;
@@ -164,7 +166,11 @@ static void animation_checks(bool export_frames) {
    if(export_frames) { char path[100]; snprintf(path,sizeof(path),"work/ui-checks/%s-%02u.ppm",names[s],f); dump_frame(path); }
    mock_time_ms+=50;
   }
-  if(!missing_assets) assert(changed); /* 验证完整周期的生产画面，不只检查计时器。 */
+  if(!missing_assets) {
+   bool animate = states[s]==UI_STATUS_WAIT_WAKE || UI_FACE_ANIMATE_DURING_CONVERSATION;
+   assert(changed==animate); /* 默认待机运动、对话静态；动画档仍验证完整周期。 */
+   if(!animate) assert(frame_submissions==submissions); /* 不只画面一样，也不能持续传输同一帧。 */
+  }
  }
  assert(event_count==events_before); /* 动画不能触发任何对话/配置动作。 */
  assert(asset_open_count==1); /* 多状态切换不重复映射/申请资源。 */
@@ -172,7 +178,7 @@ static void animation_checks(bool export_frames) {
  uint32_t menu=frame_hash();
  ui_face_update(UI_STATUS_SPEAKING,false,mock_time_ms+1000); lv_refr_now(mock_display);
  assert(menu==frame_hash()); /* 菜单不会被后台表情覆盖。 */
- puts("Production animation checks passed: cancelling displays listening immediately and continues after acknowledgement; menu stays unchanged, no business events");
+ puts("Production face checks passed: idle animation, configured conversation profile, cancelling equals listening, menu unchanged, no business events");
 }
 int main(int argc,char **argv) {
  missing_assets=argc>1 && strcmp(argv[1],"--missing-assets")==0;

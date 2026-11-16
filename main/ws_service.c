@@ -773,17 +773,22 @@ esp_err_t ws_service_send_json(const char *text)
 }
 esp_err_t ws_service_send_opus_frame(const uint8_t *data, size_t len)
 {
-    if (!data || !len || len > 65536) return ESP_ERR_INVALID_ARG;
+    if (!data || !len || len > WS_OPUS_FRAME_MAX_BYTES) return ESP_ERR_INVALID_ARG;
     if (state != WS_STATE_CONNECTED || atomic_load(&reminder_mode)) return ESP_ERR_INVALID_STATE;
-    size_t capacity = 4 * ((len + 2) / 3) + 1, written;
-    char *encoded = malloc(capacity), *json = malloc(capacity + 256);
-    if (!encoded || !json) { free(encoded); free(json); return ESP_ERR_NO_MEM; }
+    /* 固定 50 包/秒的热路径不反复 malloc/free。缓冲仅由单个 audio_in
+     * 任务使用；原子标记只拒绝并发误用，不等待、不阻塞其他控制消息。 */
+    static char encoded[4 * ((WS_OPUS_FRAME_MAX_BYTES + 2) / 3) + 1];
+    static char json[sizeof(encoded) + 256];
+    static atomic_flag busy = ATOMIC_FLAG_INIT;
+    if (atomic_flag_test_and_set(&busy)) return ESP_ERR_INVALID_STATE;
+    size_t written;
     esp_err_t err = ESP_FAIL;
-    if (mbedtls_base64_encode((unsigned char *)encoded, capacity, &written, data, len) == 0) {
+    if (mbedtls_base64_encode((unsigned char *)encoded, sizeof(encoded), &written, data, len) == 0) {
         encoded[written] = 0;
-        if (proto_build_input_audio_append(json, capacity + 256, encoded, NULL)) err = ws_service_send_json(json);
+        if (proto_build_input_audio_append(json, sizeof(json), encoded, NULL)) err = ws_service_send_json(json);
     }
-    free(encoded); free(json); return err;
+    atomic_flag_clear(&busy);
+    return err;
 }
 /* UI 事件可能排队；只有当前阶段与网络回合一致才允许改变界面。 */
 static bool reply_is(response_phase_t phase)

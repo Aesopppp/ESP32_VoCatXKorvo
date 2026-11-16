@@ -81,7 +81,9 @@ extern "C" {
  * ========================================================================= */
 #define OPUS_SAMPLE_RATE         16000
 #define OPUS_CHANNELS            1
-#define OPUS_COMPLEXITY          2       /* 0-10, lower = less CPU (was 4, dropped to reduce LISTENING overhead) */
+/* 全双工时优先给 AEC 和持续上行留出算力；仅降低编码搜索复杂度，
+ * 仍使用 16 kHz/单声道/20 ms/24 kbps Opus，不改变平台音频协议。 */
+#define OPUS_COMPLEXITY          0       /* 0-10；提高前需验证播放期间不再丢上行帧 */
 
 /* ===========================================================================
  * VAD -

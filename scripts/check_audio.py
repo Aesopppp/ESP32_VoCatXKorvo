@@ -32,12 +32,22 @@ def main():
              "reply_is", "ws_service_reply_interrupted", "ws_service_reply_finished")
     (output / "ws_platform.inc").write_text(ws[start:end] + "\n" +
         "\n\n".join(extract(ws, name) for name in names), encoding="utf-8")
+    (output / "ws_upload.inc").write_text(extract(ws, "ws_service_send_opus_frame"), encoding="utf-8")
+    wifi = (root / "main/wifi_service.c").read_text(encoding="utf-8")
+    (output / "wifi_audio.inc").write_text("\n\n".join(extract(wifi, name) for name in
+        ("apply_audio_power_save_locked", "wifi_service_set_audio_active",
+         "wifi_event_handler")), encoding="utf-8")
     audio = (root / "main/audio_out.c").read_text(encoding="utf-8")
     (output / "audio_stop.inc").write_text("\n\n".join(extract(audio, name) for name in
         ("ramp_to_zero", "audio_out_write", "audio_out_stop", "audio_out_request_stop",
          "audio_out_stop_requested")), encoding="utf-8")
     cases = {
-        "upload-clock-checks": ["tests/audio_host/upload_clock_checks.c"],
+        "wifi-audio-checks": ["-Itests/audio_host", "-Iwork/speech-handoff",
+                              "tests/audio_host/wifi_audio_checks.c"],
+        "ws-upload-checks": ["-Itests/audio_host", "-Itests/ui_host", "-Itests/host",
+                             "-Imanaged_components/espressif__cjson/cJSON", "-Iwork/speech-handoff",
+                             "tests/audio_host/ws_upload_checks.c", "main/proto_service.c",
+                             "managed_components/espressif__cjson/cJSON/cJSON.c"],
         "response-checks": ["-Itests/host", "-Imanaged_components/espressif__cjson/cJSON",
                             "tests/response_stream_checks.c", "main/proto_service.c",
                             "main/response_stream.c", "managed_components/espressif__cjson/cJSON/cJSON.c"],

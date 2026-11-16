@@ -1,5 +1,5 @@
 /* EAF 表情与现有 LVGL 共用 UI 任务和唯一 LCD flush，不创建另一个图形引擎。
- * 每 50 ms 最多解码当前一帧，忙时跳帧，不补播；菜单隐藏期间不解码。
+ * 动画启用时每 50 ms 最多解码一帧，忙时跳帧；默认对话显示静态状态图。
  * 动画表达设备状态，不读取音频、不改变会话，不推断开心/难过等语义。 */
 #include "ui_face.h"
 #include "ui_face_assets.h"
@@ -70,7 +70,8 @@ static void prepare_resources(void)
         lv_image_set_src(i == 2 ? s_indicator : s_eyes[i], &s_images[i]);
     }
     s_ready = true;
-    ESP_LOGI(TAG, "EAF ready: 20 fps, fixed PSRAM=%u bytes, frames=%u/%u/%u/%u",
+    ESP_LOGI(TAG, "EAF ready: idle=20fps conversation=%s, fixed PSRAM=%u bytes, frames=%u/%u/%u/%u",
+             UI_FACE_ANIMATE_DURING_CONVERSATION ? "20fps" : "static",
              (unsigned)((2 * EYE_PIXELS + INDICATOR_PIXELS) * sizeof(uint16_t)),
              s_animations[0].frame_count, s_animations[1].frame_count,
              s_animations[2].frame_count, s_animations[3].frame_count);
@@ -134,9 +135,10 @@ void ui_face_update(ui_status_t status, bool visible, int64_t now_ms)
     if (!s_eyes[0]) return;
     /* 取消是业务内部的短暂状态，收到快照就显示监听，不播放单独的过渡画面。
      * 在比较状态前归一化，使 cancelling -> listening 继续同一动画时间轴，避免重启首帧。
-     * 这里只改变显示；旧回答取消确认和句首音频保护仍由业务状态机负责。 */
+     * 这里只改变显示；持续上行、平台打断和回复边界仍由业务状态机负责。 */
     if (status == UI_STATUS_CANCELLING) status = UI_STATUS_LISTENING;
     if (!visible) {
+        if (!s_visible) return;
         for (unsigned i = 0; i < 2; ++i) {
             set_visible(s_eyes[i], false); set_visible(s_fallback[i], false);
         }
@@ -146,10 +148,11 @@ void ui_face_update(ui_status_t status, bool visible, int64_t now_ms)
     }
     if (!s_attempted) prepare_resources();
     bool changed = !s_visible || status != s_status;
+    bool animate = status == UI_STATUS_WAIT_WAKE || UI_FACE_ANIMATE_DURING_CONVERSATION;
     if (changed) {
         s_status = status; s_started_ms = now_ms; s_visible = true;
-    } else if (now_ms < s_next_frame_ms) return;
-    unsigned tick = (unsigned)((now_ms - s_started_ms) / FACE_FRAME_MS);
+    } else if (!animate || now_ms < s_next_frame_ms) return;
+    unsigned tick = animate ? (unsigned)((now_ms - s_started_ms) / FACE_FRAME_MS) : 0;
     /* 按时间轴选择下一帧，不把解码/刷新耗时累加成播放变慢。 */
     s_next_frame_ms = s_started_ms + ((int64_t)tick + 1) * FACE_FRAME_MS;
     bool indicator = status == UI_STATUS_LISTENING || status == UI_STATUS_SPEAKING;

@@ -134,7 +134,8 @@ esp_err_t audio_out_init(uint8_t i2c_addr)
         err=ESP_ERR_NO_MEM; goto fail;
     }
     ESP_LOGI("audio_out", "VoCat audio: 16kHz, TX mono, RX TDM slot0=mic slot1=hardware reference");
-    ESP_LOGI("audio_out", "PCM output: 150 ms prefill, 500 ms capacity, DMA=60 ms, core=1 priority=6");
+    ESP_LOGI("audio_out", "PCM output: %u ms prefill, %u ms capacity, DMA=60 ms, core=1 priority=6",
+             (unsigned)(PCM_PREFILL / 16), (unsigned)(PCM_CAPACITY / 16));
     event_bus_publish(EV_AUDIO_OUT_READY,NULL,0);
     if (callback) callback(AUDIO_OUT_EVENT_INIT_OK,callback_arg);
     return ESP_OK;

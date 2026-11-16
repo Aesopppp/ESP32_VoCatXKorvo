@@ -2,10 +2,10 @@
  * @file audio_in.h
  * @brief 音频采集服务 (P0 收音链路核心)
  *
- * 链路: ES7210 ADC → I2S0 DMA → audio_in 任务 → VAD 检测
- *       → PCM 缓冲 → (回调或队列输出)
+ * 链路: 板级麦克风 → I2S DMA → AFE → ring buffer → audio_in → Opus/WS
+ *       能量 VAD 仅通知活动；整句缓存按需启用，默认不分配。
  *
- * 采样: 16 kHz, 16-bit, mono (ES7210 单麦模式)
+ * 采样: 16 kHz, 16-bit, mono (AFE 输出)
  * VAD:  能量阈值 + 静音超时
  */
 #ifndef AUDIO_IN_H
@@ -73,7 +73,7 @@ typedef void (*audio_in_pcm_cb_t)(void *user_data,
 /**
  * @brief 一句话结束回调 (VAD 检测到句子边界)
  * @param user_data 用户上下文
- * @param pcm       完整句子 PCM (调用者负责 copy/free)
+ * @param pcm       最多 20 秒的句子 PCM，只读借用至回调返回，勿 free；异步使用需自行复制
  * @param pcm_len   PCM 字节数
  */
 typedef void (*audio_in_utterance_cb_t)(void *user_data,
@@ -135,7 +135,9 @@ esp_err_t audio_in_register_pcm_cb(audio_in_handle_t h,
                                    audio_in_pcm_cb_t cb, void *user_data);
 
 /**
- * @brief 注册句子结束回调
+ * @brief 注册句子结束回调；仅主任务在 audio_in_stop 成功后或首次启动前调用
+ * 非 NULL 回调按需申请最多 20 秒 PSRAM；传 NULL 释放缓存。回调不能阻塞上传。
+ * 活动任务返回 ESP_ERR_INVALID_STATE；申请失败返回 ESP_ERR_NO_MEM，保留原注册。
  */
 esp_err_t audio_in_register_utterance_cb(audio_in_handle_t h,
                                          audio_in_utterance_cb_t cb,

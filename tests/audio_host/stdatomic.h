@@ -4,6 +4,11 @@
 #include <stdbool.h>
 typedef bool atomic_bool;
 typedef unsigned atomic_uint;
+typedef bool atomic_flag;
+#define ATOMIC_FLAG_INIT false
+static inline bool atomic_flag_test_and_set(atomic_flag *p)
+{ bool previous = *p; *p = true; return previous; }
+static inline void atomic_flag_clear(atomic_flag *p) { *p = false; }
 #define atomic_load(p) (*(p))
 #define atomic_store(p, v) ((*(p)) = (v))
 #define atomic_fetch_add(p, v) ((*(p) += (v)) - (v))

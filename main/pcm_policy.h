@@ -3,7 +3,8 @@
 #include <stddef.h>
 #include <stdint.h>
 #define PCM_CAPACITY 8000u
-#define PCM_PREFILL 2400u
+/* 16 kHz：300 ms 起播储备，覆盖约 230 ms 的短暂供数间隔；总容量仍 500 ms。 */
+#define PCM_PREFILL 4800u
 #define PCM_BLOCK 160u
 #define PCM_DMA_BLOCKS 6u
 static inline bool pcm_can_start(size_t count, bool eof)

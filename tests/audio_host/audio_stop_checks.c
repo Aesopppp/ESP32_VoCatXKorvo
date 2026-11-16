@@ -36,6 +36,16 @@ static esp_err_t write_block(int16_t *pcm)
 #include "audio_stop.inc"
 int main(void)
 {
+    CHECK(!pcm_can_start(0, true) && !pcm_can_start(4799, false));
+    CHECK(pcm_can_start(4800, false));
+    CHECK(pcm_can_start(320, true)); /* 20 ms 短回答收到 EOF 后立即放行。 */
+    /* 已预填 300 ms 时，模拟 230 ms 没有新 PCM 到达，10 ms 消费不欠载。
+     * 只验证生产缓冲策略的储备，不模拟网络、DMA 或真实双核调度。 */
+    size_t reserve = PCM_PREFILL;
+    for (unsigned ms = 0; ms < 230; ms += 10) {
+        CHECK(pcm_take_count(reserve) == PCM_BLOCK); reserve -= PCM_BLOCK;
+    }
+    CHECK(reserve == 1120);
     stream_open=output_started=playback_streaming=true; pcm_count=PCM_CAPACITY;
     pcm_write=123; pcm_read=23; last_sample=1000;
     int16_t pcm[320]={1}; interrupt_on_wait=true;

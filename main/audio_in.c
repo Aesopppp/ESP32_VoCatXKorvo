@@ -7,7 +7,7 @@
  *  audio_in_start_from_ringbuf() 启动后从该 ring buffer 读取 PCM，
  *  自身不再初始化 I²S。
  *
- *  链路: (AFE) → ring buffer → VAD → PCM 缓冲 → Opus 编码 → WS JSON
+ *  链路: (AFE) → ring buffer → Opus 编码 → WS JSON；VAD 仅记录活动状态。
  *
  *  采样: 16 kHz, 16-bit, mono
  *  VAD:  能量阈值 + 静音超时（由 wake_word 通过 AFE 提供统一 PCM 流）
@@ -17,10 +17,11 @@
 #include "board_config.h"
 #include "wake_word.h"
 #include "ws_service.h"
+#include "wifi_service.h"
 #include "opus_codec.h"
-#include "audio_upload_policy.h"
 #include "esp_log.h"
 #include "esp_err.h"
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_timer.h"
@@ -49,14 +50,14 @@ struct audio_in_impl {
 
     /* VAD 状态机 */
     vad_state_t              vad_state;
-    int16_t                 *vad_buf;       /* 累积当前句子的 PCM */
+    int16_t                 *vad_buf;       /* 仅注册整句回调时分配；实时上传不需要 */
     size_t                   vad_buf_cap;
     size_t                   vad_buf_len;
     int64_t                  speech_start_ms;
     int64_t                  last_speech_ms;
 
     /* 能量阈值滑动窗口 */
-    int32_t                  energy_sum;
+    int64_t                  energy_sum;    /* 8 帧均方值相加可能超过 int32_t */
     int32_t                  energy_count;
     int32_t                  energy_avg;
 
@@ -65,10 +66,10 @@ struct audio_in_impl {
     int16_t                  opus_pcm[320];
     size_t                   opus_samples;
 
-    /* 连续上传：20 ms 节拍，不在播放/平台打断之间重启编码器。 */
-    audio_upload_clock_t     upload_clock;
+    /* 连续上传由 AFE 的真实采样时钟驱动；每 320 个样本组成 20 ms Opus。 */
     int64_t                  stats_at;
-    uint32_t                 stats_packets, encode_max_us, send_max_us, late_max_us;
+    uint32_t                 stats_packets, encode_max_us, send_max_us;
+    uint64_t                 encode_work_us, send_work_us; /* 含调度等待的累计墙钟时间 */
     uint32_t                 sent_end; /* h->lock 保护，成功发送后才推进 */
 
     /* 任务 */
@@ -182,18 +183,13 @@ static void process_vad_frame(audio_in_handle_t h, const int16_t *pcm,
     if (h->vad_state == VAD_STATE_SILENCE) {
         int64_t speech_dur_ms = h->last_speech_ms - h->speech_start_ms;
 
-        if (speech_dur_ms >= h->cfg.min_utterance_ms && h->vad_buf_len > 0) {
-            ESP_LOGI(TAG, "VAD: utterance done, len=%zu bytes, dur=%lld ms",
-                     h->vad_buf_len, speech_dur_ms);
+        if (speech_dur_ms >= h->cfg.min_utterance_ms) {
+            ESP_LOGD(TAG, "VAD: utterance done, dur=%lld ms", speech_dur_ms);
 
-            if (h->utt_cb) {
-                int16_t *copy = malloc(h->vad_buf_len);
-                if (copy) {
-                    memcpy(copy, h->vad_buf, h->vad_buf_len);
-                    h->utt_cb(h->utt_cb_arg, copy, h->vad_buf_len);
-                    free(copy);
-                }
-            }
+            /* 回调只借用缓存直到返回，无须再次复制整句。默认未注册回调，
+             * 仍保留活动事件供空闲计时使用，不积累/复制任何整句 PCM。 */
+            if (h->utt_cb && h->vad_buf_len)
+                h->utt_cb(h->utt_cb_arg, h->vad_buf, h->vad_buf_len);
 
             event_bus_publish(EV_AUDIO_SPEECH_END, NULL, 0);
         }
@@ -214,7 +210,7 @@ static void fail_audio_upload(audio_in_handle_t h, esp_err_t err)
     event_bus_publish(EV_AUDIO_UPLOAD_FAILED, (void *)(uintptr_t)h->connection_generation, 0);
 }
 
-/* 暂停发生在消费下一采样前，不丢当前帧余量。不得在持缓存锁/播放锁时等待。 */
+/* 暂停在拷贝下一批采样或发送前确认，保留半包。不得在持缓存锁/播放锁时等待。 */
 static bool wait_upload_enabled(audio_in_handle_t h)
 {
     while (h->running && atomic_load(&h->paused)) {
@@ -246,31 +242,36 @@ static void encode_and_send(audio_in_handle_t h, const int16_t *pcm, size_t pcm_
         }
     }
 
-    /* Opus 编码 */
-    uint8_t opus_out[256];
-    for (size_t i = 0; i < pcm_samples && h->running; ++i) {
+    /* 按帧拼接，避免对每个采样执行原子查询。32 ms AFE 帧可能产生两包
+     * 20 ms Opus，剩余采样留给下一次读取；不补静音、不重复发送。 */
+    uint8_t opus_out[WS_OPUS_FRAME_MAX_BYTES];
+    size_t consumed = 0;
+    while (consumed < pcm_samples && h->running) {
         if (!wait_upload_enabled(h)) break;
-        h->opus_pcm[h->opus_samples++] = pcm[i];
+        size_t count = 320 - h->opus_samples;
+        if (count > pcm_samples - consumed) count = pcm_samples - consumed;
+        memcpy(h->opus_pcm + h->opus_samples, pcm + consumed, count * sizeof(int16_t));
+        h->opus_samples += count;
+        consumed += count;
         if (h->opus_samples == 320) {
             int64_t encode_at = esp_timer_get_time();
             int opus_len = opus_enc_encode(h->opus_enc, h->opus_pcm, sizeof(h->opus_pcm), opus_out, sizeof(opus_out));
             uint32_t encode_us = (uint32_t)(esp_timer_get_time() - encode_at);
+            h->encode_work_us += encode_us;
             if (encode_us > h->encode_max_us) h->encode_max_us = encode_us;
             if (opus_len > 0) {
-                int64_t wait_us = audio_upload_deadline(&h->upload_clock) - esp_timer_get_time();
-                if (wait_us > 0) vTaskDelay(pdMS_TO_TICKS((wait_us + 999) / 1000));
                 if (!wait_upload_enabled(h)) break;
+                /* AFE 已按真实时间产出 PCM。取消第二套发送时钟，网络短暂阻塞
+                 * 后及时消费有界 FIFO，避免额外等待把延迟累积成录音丢帧。 */
                 int64_t sent_at = esp_timer_get_time();
-                int64_t late = h->upload_clock.started ? sent_at - h->upload_clock.next_us : 0;
-                if (late > h->late_max_us) h->late_max_us = (uint32_t)late;
                 esp_err_t err = ws_service_send_opus_frame(opus_out, opus_len);
                 uint32_t send_us = (uint32_t)(esp_timer_get_time() - sent_at);
+                h->send_work_us += send_us;
                 if (send_us > h->send_max_us) h->send_max_us = send_us;
                 if (err == ESP_OK) {
-                    audio_upload_advance(&h->upload_clock, sent_at);
                     ++h->stats_packets;
                     xSemaphoreTake(h->lock, portMAX_DELAY);
-                    h->sent_end = sample_start + i + 1;
+                    h->sent_end = sample_start + consumed;
                     xSemaphoreGive(h->lock);
                 }
                 else fail_audio_upload(h, err);
@@ -292,14 +293,16 @@ static void log_upload_stats(audio_in_handle_t h)
     wake_word_audio_progress_t progress;
     wake_word_get_audio_progress(&progress);
     ESP_LOGI(TAG, "Upload stats: window_ms=%lu packets=%lu audio_ms=%lu fifo_ms=%lu "
-             "encode_max_us=%lu send_max_us=%lu late_max_us=%lu",
+             "encode_max_us=%lu send_max_us=%lu encode_work_ms=%lu send_work_ms=%lu",
              (unsigned long)((now - h->stats_at) / 1000), (unsigned long)h->stats_packets,
              (unsigned long)(h->stats_packets * 20),
              (unsigned long)((uint32_t)(progress.written_end - progress.read_end) / 16),
              (unsigned long)h->encode_max_us, (unsigned long)h->send_max_us,
-             (unsigned long)h->late_max_us);
+             (unsigned long)(h->encode_work_us / 1000),
+             (unsigned long)(h->send_work_us / 1000));
     h->stats_at = now;
-    h->stats_packets = h->encode_max_us = h->send_max_us = h->late_max_us = 0;
+    h->stats_packets = h->encode_max_us = h->send_max_us = 0;
+    h->encode_work_us = h->send_work_us = 0;
 }
 
 /* ===========================================================================
@@ -351,6 +354,9 @@ static void audio_in_task(void *param)
         /* VAD */
         if (h->running) process_vad_frame(h, frame_buf, samples_read, ts);
         log_upload_stats(h);
+        /* 积压追赶期间也让低优先级任务获得运行机会；每个 AFE 帧只让出一拍，
+         * 不对每包 Opus 另加 20 ms 等待。空队列仍由上面的短等待节流。 */
+        if (h->running) vTaskDelay(1);
     }
 
     free(frame_buf);
@@ -386,14 +392,7 @@ audio_in_handle_t audio_in_create(const audio_in_config_t *cfg)
     h->cfg = cfg ? *cfg : audio_in_default_config();
     h->frame_samples = h->cfg.sample_rate * h->cfg.frame_ms / 1000;
 
-    /* VAD 缓冲区: 最多 20 秒语音 */
-    h->vad_buf_cap = h->cfg.sample_rate * 20 * 2;
-    h->vad_buf = heap_caps_malloc(h->vad_buf_cap, MALLOC_CAP_8BIT);
-    if (h->vad_buf == NULL) {
-        ESP_LOGE(TAG, "vad_buf alloc failed");
-        free(h);
-        return NULL;
-    }
+    /* 默认只有实时上传和活动检测，不申请 20 秒（640 KB）的整句缓存。 */
 
     h->lock = xSemaphoreCreateMutex();
     if (h->lock == NULL) {
@@ -466,14 +465,17 @@ esp_err_t audio_in_start_from_ringbuf(audio_in_handle_t h, RingbufHandle_t ringb
     xSemaphoreTake(h->lock, portMAX_DELAY);
     h->sent_end = progress.read_end;
     xSemaphoreGive(h->lock);
-    memset(&h->upload_clock, 0, sizeof(h->upload_clock));
     h->stats_at = esp_timer_get_time();
-    h->stats_packets = h->encode_max_us = h->send_max_us = h->late_max_us = 0;
+    h->stats_packets = h->encode_max_us = h->send_max_us = 0;
+    h->encode_work_us = h->send_work_us = 0;
     /* 清除上一次任务的完成信号，再创建新任务。 */
     xSemaphoreTake(h->done_sem, 0);
 
     /* VAD 状态复位 */
     vad_reset(h);
+    /* 20 ms 连续上行不等待 Wi-Fi modem sleep。由 Wi-Fi 服务保管模式，
+     * 失败只告警；结束/创建任务失败后恢复省电，监听与播放切换不反复切换。 */
+    (void)wifi_service_set_audio_active(true);
 
     BaseType_t ret = xTaskCreatePinnedToCore(
         audio_in_task, "audio_in",
@@ -482,6 +484,7 @@ esp_err_t audio_in_start_from_ringbuf(audio_in_handle_t h, RingbufHandle_t ringb
     if (ret != pdPASS) {
         h->running = false;
         h->task_h = NULL;
+        (void)wifi_service_set_audio_active(false);
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
@@ -540,6 +543,8 @@ esp_err_t audio_in_stop(audio_in_handle_t h)
 
     h->opus_samples = 0;
 
+    /* 任务确实退出后才恢复省电；stop 超时则保持性能模式供后续恢复。 */
+    (void)wifi_service_set_audio_active(false);
     ESP_LOGI(TAG, "audio_in stopped");
     return ESP_OK;
 }
@@ -558,6 +563,19 @@ esp_err_t audio_in_register_utterance_cb(audio_in_handle_t h,
                                          void *user_data)
 {
     if (h == NULL) return ESP_ERR_INVALID_ARG;
+    /* 与 start/stop 一样由主任务串行调用，只在任务完全停止后调整所有权。 */
+    if (h->running || h->task_h) return ESP_ERR_INVALID_STATE;
+    if (cb && !h->vad_buf) {
+        size_t capacity = (size_t)h->cfg.sample_rate * 20 * sizeof(int16_t);
+        h->vad_buf = heap_caps_malloc(capacity, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!h->vad_buf) return ESP_ERR_NO_MEM;
+        h->vad_buf_cap = capacity;
+    } else if (!cb) {
+        free(h->vad_buf);
+        h->vad_buf = NULL;
+        h->vad_buf_cap = 0;
+    }
+    vad_reset(h);
     h->utt_cb     = cb;
     h->utt_cb_arg = user_data;
     return ESP_OK;

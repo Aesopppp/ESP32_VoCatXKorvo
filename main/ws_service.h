@@ -82,8 +82,11 @@ esp_err_t ws_service_deinit(void);
  *
  * @param opus_data  Opus payload (raw bytes from opus_enc_encode)
  * @param opus_len   payload length in bytes
- * @return ESP_OK on enqueue; ESP_ERR_INVALID_STATE if WS not CONNECTED.
+ * 仅 audio_in 单生产者调用，内部复用固定发送缓冲；并发误用返回 INVALID_STATE。
+ * 同步发送，最多等待 1 秒；不持播放锁/采样缓存锁调用。
+ * @return ESP_OK on successful send; ESP_ERR_INVALID_STATE if unavailable.
  */
+#define WS_OPUS_FRAME_MAX_BYTES 256u /* 与 16 kHz/20 ms 编码输出缓冲一致 */
 esp_err_t ws_service_send_opus_frame(const uint8_t *opus_data, size_t opus_len);
 /* 只读当前回复阶段，避免 UI 消费迟到事件后覆盖新回合。 */
 bool ws_service_reply_interrupted(void);

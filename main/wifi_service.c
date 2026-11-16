@@ -38,6 +38,7 @@ static SemaphoreHandle_t s_mutex = NULL;
 static atomic_bool s_connect_enabled;
 static esp_timer_handle_t s_connect_timer = NULL;
 static int64_t s_connect_deadline_us; /* 与 start/stop/事件处理共用递归互斥锁。 */
+static bool s_audio_active;          /* 同一把锁保护；断线期间保留音频性能意图。 */
 #define WIFI_CONNECT_TIMEOUT_MS 60000
 static wifi_state_t get_state(void);
 static void set_state(wifi_state_t st);
@@ -88,6 +89,34 @@ static wifi_state_t get_state(void)
     return st;
 }
 
+/* 只能在持有 s_mutex 且 STA 已关联 AP 时调用。省电切换失败只记录，
+ * 不把性能优化变成新的掉线/重连条件。 */
+static esp_err_t apply_audio_power_save_locked(void)
+{
+    wifi_ps_type_t mode = s_audio_active ? WIFI_PS_NONE : WIFI_PS_MIN_MODEM;
+    esp_err_t err = esp_wifi_set_ps(mode);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Wi-Fi power save: %s", s_audio_active ?
+                 "NONE (continuous audio)" : "MIN_MODEM (idle)");
+    } else {
+        ESP_LOGW(TAG, "Wi-Fi power save update failed: %s", esp_err_to_name(err));
+    }
+    return err;
+}
+
+esp_err_t wifi_service_set_audio_active(bool active)
+{
+    if (!s_mutex) return ESP_ERR_INVALID_STATE;
+    lock();
+    s_audio_active = active;
+    esp_err_t err = ESP_OK;
+    if (s_wifi_state == WIFI_STATE_CONNECTED || s_wifi_state == WIFI_STATE_GOT_IP) {
+        err = apply_audio_power_save_locked();
+    }
+    unlock();
+    return err;
+}
+
 /* ── 事件处理器 ───────────────────────────────────────────────────────────── */
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
@@ -108,6 +137,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
             case WIFI_EVENT_STA_CONNECTED:
                 ESP_LOGI(TAG, "Wi-Fi connected (SSID matched)");
                 set_state(WIFI_STATE_CONNECTED);
+                /* 断线恢复或 STA 重启后沿用当前音频模式。 */
+                (void)apply_audio_power_save_locked();
                 led_set_wifi_err();
                 break;
 
