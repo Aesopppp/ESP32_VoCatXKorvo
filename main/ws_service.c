@@ -57,6 +57,9 @@ static uint32_t queue_wait_max_ms; /* worker 专用，包含正常 PCM 背压等
 static atomic_bool reminder_mode;
 static uint32_t reminder_started_ms; /* playback_lock 保护 */
 static atomic_uint reminder_rx_ms;
+static char reminder_device_id[65];
+static char reminder_task_ids[PROTO_REMINDER_TASK_IDS_MAX][129];
+static size_t reminder_task_count;
 typedef struct {
     uint8_t *data;
     size_t len;
@@ -165,7 +168,7 @@ static void log_server_error(const proto_msg_t *msg)
     size_t len = msg->error_msg_len > 0 ? (size_t)msg->error_msg_len : 0;
     if (len >= sizeof(message)) len = sizeof(message) - 1;
     if (len) memcpy(message, msg->error_msg, len);
-    /* 提醒错误可能回显原始请求，其中 to 含企业 Key；只保留错误码。 */
+    /* 提醒错误可能回显含 token 的 auth；只保留错误码。 */
     bool sensitive = credentials_from_handshake || atomic_load(&reminder_mode) || strstr(message, "sk-") || strstr(message, "token") ||
                      strstr(message, "password") || strstr(message, "Bearer");
     const cfg_key_t keys[] = { CFG_KEY_ACOS_TOKEN, CFG_KEY_WIFI_PASSWORD };
@@ -194,6 +197,17 @@ static void log_server_error(const proto_msg_t *msg)
 static bool observe_control(const proto_msg_t *msg)
 {
     atomic_store(&last_control_event, msg->evt);
+    if (atomic_load(&reminder_mode)) {
+        /* 提醒没有上行人声；response ID/音频结束边界仍按同一协议镜像校验。 */
+        if (msg->evt == PROTO_EVT_SPEECH_STARTED || msg->evt == PROTO_EVT_SPEECH_STOPPED) return true;
+        response_stream_action_t action = response_stream_control(&wire_reply,
+            atomic_load(&wire_turn), msg);
+        if (action == RESPONSE_STREAM_AUDIO_END)
+            atomic_store(&wire_done_turn, atomic_load(&wire_turn));
+        else if (!wire_reply.audio_eof) atomic_store(&wire_done_turn, 0);
+        if (msg->evt == PROTO_EVT_RESPONSE_DONE) return action == RESPONSE_STREAM_AUDIO_END;
+        return true;
+    }
     if (msg->evt == PROTO_EVT_SPEECH_STARTED && state == WS_STATE_CONNECTED &&
         !atomic_load(&reminder_mode)) {
         response_stream_user_started(&wire_reply);
@@ -206,8 +220,6 @@ static bool observe_control(const proto_msg_t *msg)
         response_stream_next_turn(&wire_reply, atomic_fetch_add(&wire_turn, 1) + 1);
         atomic_store(&wire_done_turn, 0);
         atomic_store(&rx_audio_last_ms, 0);
-    } else if (atomic_load(&reminder_mode) && msg->evt == PROTO_EVT_RESPONSE_DONE) {
-        atomic_store(&wire_done_turn, atomic_load(&wire_turn));
     } else if (!atomic_load(&reminder_mode)) {
         response_stream_action_t action = response_stream_control(&wire_reply,
             atomic_load(&wire_turn), msg);
@@ -302,11 +314,12 @@ static void handle_frame(const rx_frame_t *packet)
         if (state == WS_STATE_CONNECTED &&
             response_stream_accept_audio(&reply, packet->turn)) {
             audio_out_set_streaming(true);
-            if (audio_out_play_opus(packet->data, packet->len) < 0) {
+            int samples = audio_out_play_opus(packet->data, packet->len);
+            if (samples < 0) {
                 /* 平台信号可解除正在等待 PCM 空位的写入；这不是解码失败。 */
                 if (packet->speech_epoch == atomic_load(&speech_epoch) && !audio_out_stop_requested())
                     publish(EV_WS_SERVER_ERROR, packet->generation);
-            } else {
+            } else if (samples > 0) {
                 ++played_frames;
                 /* 每回合首帧/工具续流首帧各记录一次，不逐帧打印。 */
                 if (played_frames == 1 || after_tool)
@@ -368,15 +381,19 @@ static void handle_frame(const rx_frame_t *packet)
             audio_out_set_streaming(false);
         } else if (action == RESPONSE_STREAM_CANCELLED) {
             audio_out_stop();
-            publish(EV_WS_RESPONSE_INTERRUPTED, packet->generation);
+            publish(atomic_load(&reminder_mode) ? EV_WS_SERVER_ERROR : EV_WS_RESPONSE_INTERRUPTED,
+                    packet->generation);
         } else if (action == RESPONSE_STREAM_FAILED) {
             audio_out_stop();
             /* 模型本轮失败只收尾当前回复；连接级 error 才走错误恢复。 */
-            publish(EV_WS_RESPONSE_INTERRUPTED, packet->generation);
+            publish(atomic_load(&reminder_mode) ? EV_WS_SERVER_ERROR : EV_WS_RESPONSE_INTERRUPTED,
+                    packet->generation);
         } else if (action == RESPONSE_STREAM_CONTINUED) {
             /* 仅明确的新 response.created 能恢复已排空回合；迟到二进制不能。 */
-            response_stream_hold_input(&reply);
-            publish(EV_WS_RESPONSE_CONTINUED, packet->generation);
+            if (!atomic_load(&reminder_mode)) {
+                response_stream_hold_input(&reply);
+                publish(EV_WS_RESPONSE_CONTINUED, packet->generation);
+            }
         }
         break;
     }
@@ -526,7 +543,7 @@ static void on_ws(void *arg, esp_event_base_t base, int32_t id, void *event)
             rx_frame_t packet = {.data=frame, .len=received, .opcode=opcode, .generation=gen};
             observe_rx_packet(&packet);
             /* 迟到二进制不能撤销 audio.done；窗口由明确的回合事件重开。 */
-            if (opcode == 2 && !atomic_load(&reminder_mode))
+            bool audio_accepted = opcode == 2 &&
                 response_stream_accept_audio(&wire_reply, atomic_load(&wire_turn));
             bool deliver = true;
             if (opcode == 1) {
@@ -536,8 +553,7 @@ static void on_ws(void *arg, esp_event_base_t base, int32_t id, void *event)
                 packet.session_control = result == PROTO_OK &&
                     (msg.evt == PROTO_EVT_PROXY_CONNECTED || msg.evt == PROTO_EVT_ERROR);
             }
-            if (atomic_load(&reminder_mode) &&
-                (opcode == 2 || atomic_load(&wire_done_turn) == atomic_load(&wire_turn)))
+            if (atomic_load(&reminder_mode) && audio_accepted)
                 atomic_store(&reminder_rx_ms, (uint32_t)(esp_timer_get_time() / 1000));
             packet.turn = atomic_load(&wire_turn);
             packet.speech_epoch = atomic_load(&speech_epoch);
@@ -671,12 +687,19 @@ esp_err_t ws_service_authenticate(void)
     const char *token = credentials->token;
     log_auth_token_fingerprint(token, credentials_from_handshake ?
                               "HTTP/handshake/websocket.token" : "NVS/korvo_cfg/acos_token");
-    size_t capacity = strlen(token) * 6 + 32;
+    size_t capacity = reminder_task_count ? PROTO_REMINDER_AUTH_FRAME_SIZE : strlen(token) * 6 + 32;
     char *auth = heap_caps_malloc(capacity, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!auth) return ESP_ERR_NO_MEM;
-    size_t len = proto_build_auth_frame(auth, capacity, token);
+    const char *ids[PROTO_REMINDER_TASK_IDS_MAX];
+    for (size_t i = 0; i < reminder_task_count; ++i) ids[i] = reminder_task_ids[i];
+    size_t len = reminder_task_count ?
+        proto_build_reminder_auth_frame(auth, capacity, token, reminder_device_id, ids, reminder_task_count) :
+        proto_build_auth_frame(auth, capacity, token);
     esp_err_t err = len && esp_websocket_client_send_text(client, auth, len, pdMS_TO_TICKS(1000)) == (int)len
                     ? ESP_OK : ESP_FAIL;
+    if (err == ESP_OK && reminder_task_count)
+        ESP_LOGI(TAG, "Reminder auth sent: device_id=%s task_count=%u (token redacted)",
+                 reminder_device_id, (unsigned)reminder_task_count);
     volatile char *wipe = auth;
     for (size_t i = 0; i < capacity; ++i) wipe[i] = 0;
     free(auth);
@@ -706,6 +729,11 @@ esp_err_t ws_service_disconnect(void)
     atomic_store(&speech_epoch, 0);
     applied_speech_epoch = 0;
     atomic_store(&reminder_mode, false);
+    reminder_device_id[0] = 0;
+    memset(reminder_task_ids, 0, sizeof(reminder_task_ids));
+    reminder_task_count = 0;
+    reminder_started_ms = 0;
+    atomic_store(&reminder_rx_ms, 0);
     audio_out_stop();
     xSemaphoreGive(playback_lock);
     rx_frame_t packet;
@@ -798,6 +826,12 @@ static bool reply_is(response_phase_t phase)
     bool matches = state == WS_STATE_CONNECTED && reply.phase == phase &&
         (phase == RESPONSE_DISCARD || reply.turn == atomic_load(&wire_turn)) &&
         applied_speech_epoch == atomic_load(&speech_epoch);
+    if (matches && phase == RESPONSE_IDLE && atomic_load(&reminder_mode)) {
+        /* 完成事件排队期间，RX 可能已经收到下一段、worker 尚未处理。
+         * 提醒确认会关闭整条连接，必须同时核对网络边界与待处理队列。 */
+        matches = reply_boundary_received(reply.turn, atomic_load(&wire_done_turn)) &&
+            !atomic_load(&rx_dispatching) && uxQueueMessagesWaiting(rx_queue) == 0;
+    }
     xSemaphoreGive(playback_lock);
     return matches;
 }
@@ -819,28 +853,37 @@ void ws_service_log_response_wait(void)
     xSemaphoreGive(playback_lock);
 }
 
-esp_err_t ws_service_request_reminder(const char *payload)
+esp_err_t ws_service_prepare_reminder(const char *device_id,
+                                      const char *const *task_ids, size_t task_count)
 {
-    if (!payload || !payload[0]) return ESP_ERR_INVALID_ARG;
+    if (!device_id || !device_id[0] || strlen(device_id) >= sizeof(reminder_device_id) ||
+        !task_ids || !task_count || task_count > PROTO_REMINDER_TASK_IDS_MAX)
+        return ESP_ERR_INVALID_ARG;
+    for (size_t i = 0; i < task_count; ++i) {
+        if (!task_ids[i] || !task_ids[i][0] || strlen(task_ids[i]) > 128) return ESP_ERR_INVALID_ARG;
+        for (const unsigned char *p = (const unsigned char *)task_ids[i]; *p; ++p)
+            if (*p < '0' || *p > '9') return ESP_ERR_INVALID_ARG;
+    }
     xSemaphoreTake(playback_lock, portMAX_DELAY);
-    if (state != WS_STATE_CONNECTED || reply.phase != RESPONSE_IDLE ||
+    if (state != WS_STATE_DISCONNECTED || reply.phase != RESPONSE_IDLE ||
         atomic_load(&reminder_mode) || !audio_out_is_drained()) {
         xSemaphoreGive(playback_lock);
         return ESP_ERR_INVALID_STATE;
     }
-    /* 提醒没有 speech_stopped。先创建接收回合，再发送，避免快速下行被丢弃。
-     * MQTT 消息已由服务层校验/持有，这里不解析或重新序列化。 */
+    strcpy(reminder_device_id, device_id);
+    for (size_t i = 0; i < task_count; ++i) strcpy(reminder_task_ids[i], task_ids[i]);
+    reminder_task_count = task_count;
+    /* 先开放接收门，再连接；智能体可能在 auth 成功后立即发音频。 */
     response_stream_begin(&reply, atomic_fetch_add(&wire_turn, 1) + 1);
+    response_stream_begin(&wire_reply, atomic_load(&wire_turn));
     atomic_store(&wire_done_turn, 0);
     played_frames = discarded_frames = 0;
     reminder_started_ms = (uint32_t)(esp_timer_get_time() / 1000);
     atomic_store(&reminder_rx_ms, reminder_started_ms);
     atomic_store(&reminder_mode, true);
     xSemaphoreGive(playback_lock);
-    /* 不持 playback_lock 等待网络；接收任务仍能处理快速到达的音频。 */
-    esp_err_t err = ws_service_send_json(payload);
-    if (err == ESP_OK) ESP_LOGI(TAG, "Reminder MQTT payload forwarded unchanged; waiting for Opus audio");
-    return err; /* 失败由主任务断连清理，不能自动重播可能已发送的请求。 */
+    ESP_LOGI(TAG, "Reminder WebSocket auth prepared: task_count=%u", (unsigned)task_count);
+    return ESP_OK;
 }
 
 bool ws_service_reminder_timed_out(void)

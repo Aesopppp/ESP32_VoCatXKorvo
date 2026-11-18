@@ -216,6 +216,57 @@ size_t proto_build_auth_frame(char *buf, size_t buf_size, const char *token)
     return length;
 }
 
+static bool reminder_task_id_valid(const char *id)
+{
+    if (!id || !*id || strlen(id) > 128) return false;
+    for (const unsigned char *p = (const unsigned char *)id; *p; ++p)
+        if (*p < '0' || *p > '9') return false;
+    return true;
+}
+
+size_t proto_build_reminder_auth_frame(char *buf, size_t buf_size, const char *token,
+                                       const char *device_id,
+                                       const char *const *task_ids, size_t task_count)
+{
+    if (!buf || !buf_size) return 0;
+    buf[0] = 0;
+    if (!token || !*token || strlen(token) > PROTO_AUTH_TOKEN_MAX ||
+        !device_id || !*device_id || strlen(device_id) > 64 || !task_ids ||
+        task_count == 0 || task_count > PROTO_REMINDER_TASK_IDS_MAX) return 0;
+    for (size_t i = 0; i < task_count; ++i)
+        if (!reminder_task_id_valid(task_ids[i])) return 0;
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON *ids = cJSON_CreateArray();
+    bool ok = root && ids &&
+        cJSON_AddStringToObject(root, "type", "auth") &&
+        cJSON_AddStringToObject(root, "api_key", token) &&
+        cJSON_AddStringToObject(root, "device_id", device_id);
+    for (size_t i = 0; ok && i < task_count; ++i) {
+        cJSON *id = cJSON_CreateString(task_ids[i]);
+        if (!id || !cJSON_AddItemToArray(ids, id)) {
+            cJSON_Delete(id);
+            ok = false;
+        }
+    }
+    if (ok) {
+        ok = cJSON_AddItemToObject(root, "task_ids", ids);
+        if (ok) ids = NULL;
+    }
+    char *json = ok ? cJSON_PrintUnformatted(root) : NULL;
+    size_t length = json ? strlen(json) : 0;
+    if (!length || length >= buf_size) {
+        if (buf_size) buf[0] = 0;
+        length = 0;
+    } else {
+        memcpy(buf, json, length + 1);
+    }
+    cJSON_free(json);
+    cJSON_Delete(ids);
+    cJSON_Delete(root);
+    return length;
+}
+
 size_t proto_build_input_audio_append(char *buf, size_t buf_size,
                                        const char *base64_audio,
                                        const char *event_id)

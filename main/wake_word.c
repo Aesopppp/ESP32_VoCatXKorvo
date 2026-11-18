@@ -69,6 +69,7 @@ static int s_fetch_chunksize = 0;
 #define AUDIO_UPLOAD_FIFO_MS 512u
 #define AUDIO_DIAGNOSTIC_ENERGY 2500
 static SemaphoreHandle_t s_audio_buffer_lock;
+static bool s_audio_buffer_enabled = true; /* 同一缓存锁保护；提醒只播放，不生成上传积压。 */
 static wake_word_audio_progress_t s_audio_progress;
 static uint32_t s_overflow_log_ms;
 static uint32_t s_overflow_frames; /* 限频日志之间累计，不能只报最后一次丢帧。 */
@@ -139,7 +140,7 @@ static void buffer_afe_audio(const afe_fetch_result_t *res)
     }
     xSemaphoreTake(s_audio_buffer_lock, portMAX_DELAY);
     app_state_t current = app_state_get();
-    if (current != APP_STATE_LISTENING && current != APP_STATE_PLAYING) {
+    if (!s_audio_buffer_enabled || (current != APP_STATE_LISTENING && current != APP_STATE_PLAYING)) {
         xSemaphoreGive(s_audio_buffer_lock);
         return;
     }
@@ -563,6 +564,15 @@ void wake_word_clear_audio_buffer(void)
     if (!s_ringbuf || !s_audio_buffer_lock) return;
     xSemaphoreTake(s_audio_buffer_lock, portMAX_DELAY);
     clear_audio_buffer_locked();
+    xSemaphoreGive(s_audio_buffer_lock);
+}
+
+void wake_word_set_audio_buffer_enabled(bool enabled)
+{
+    if (!s_ringbuf || !s_audio_buffer_lock) return;
+    xSemaphoreTake(s_audio_buffer_lock, portMAX_DELAY);
+    if (s_audio_buffer_enabled != enabled) clear_audio_buffer_locked();
+    s_audio_buffer_enabled = enabled;
     xSemaphoreGive(s_audio_buffer_lock);
 }
 

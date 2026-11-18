@@ -146,8 +146,10 @@ static int64_t now_ms(void) { return esp_timer_get_time() / 1000; }
 
 static void end_conversation(const char *reason)
 {
+    device_mqtt_service_set_dispatch_allowed(false);
     if (reminder_task) {
-        device_mqtt_service_finish_task(reminder_task, false);
+        device_mqtt_service_finish_tasks(reminder_task,
+            wifi_service_get_state() != WIFI_STATE_GOT_IP ? DEVICE_TASK_NETWORK_WAIT : DEVICE_TASK_FAILED);
         reminder_task = NULL;
     }
     reminder_requested = false;
@@ -164,6 +166,7 @@ static void end_conversation(const char *reason)
     if (err != ESP_OK) ESP_LOGW(TAG, "WS stop failed: %s", esp_err_to_name(err));
     app_state_back_to_wait_wake(false);
     wake_word_clear_audio_buffer();
+    wake_word_set_audio_buffer_enabled(true);
     if (wifi_service_get_state() == WIFI_STATE_GOT_IP) led_set_waiting_wake();
     else led_set_wifi_err();
     ESP_LOGI(TAG, "Conversation ended: %s; waiting for wake word", reason);
@@ -229,6 +232,12 @@ static void retry_voice_connection(int64_t now)
     if (err == ESP_OK) err = ws_service_set_credentials(
         configuration ? configuration->websocket.url : NULL,
         configuration ? configuration->websocket.token : NULL);
+    if (err == ESP_OK && reminder_task) {
+        const char *task_ids[DEVICE_TASK_QUEUE_SIZE];
+        for (unsigned i = 0; i < reminder_task->count; ++i)
+            task_ids[i] = reminder_task->task_ids[i];
+        err = ws_service_prepare_reminder(reminder_task->device_id, task_ids, reminder_task->count);
+    }
     if (err == ESP_OK) err = ws_service_connect();
     if (err == ESP_OK) {
         retry_at_ms = 0;
@@ -236,6 +245,7 @@ static void retry_voice_connection(int64_t now)
         auth_deadline_ms = now_ms() + 20000;
     } else {
         ESP_LOGW(TAG, "WebSocket prepare/start failed: %s", esp_err_to_name(err));
+        if (reminder_task) { end_conversation("reminder connection failed"); return; }
         retry_at_ms = now_ms() + 5000;
     }
 }
@@ -278,6 +288,7 @@ static void start_conversation(const char *reason)
         return;
     }
     device_mqtt_service_on_wake();
+    device_mqtt_service_set_dispatch_allowed(false);
     if (reminder_task) end_conversation("user wake during reminder");
     if (session_requested) {
         if (app_state_get() == APP_STATE_LISTENING) app_state_reset_silence_timer();
@@ -471,8 +482,7 @@ static bool tagged_ws_event(event_type_t id)
            id == EV_AUDIO_UPLOAD_FAILED;
 }
 
-/* 语音协议尚未确定，服务的默认开关为关闭。未来启用原文适配器时，
- * 只在待机领取任务，避免把提醒和正在进行的问答混到同一响应回合。 */
+/* 提醒不打断活跃对话；空闲时批量起独立 WS 会话，由智能体按 task_ids 取内容。 */
 static void poll_reminder(void)
 {
     if (reminder_task) {
@@ -484,8 +494,9 @@ static void poll_reminder(void)
     if (session_requested || provisioning_service_is_active() ||
         wifi_service_get_state() != WIFI_STATE_GOT_IP ||
         app_state_get() != APP_STATE_WAIT_WAKE || !device_mqtt_service_voice_enabled()) return;
-    reminder_task = device_mqtt_service_take_task();
+    reminder_task = device_mqtt_service_take_tasks();
     if (!reminder_task) return;
+    device_mqtt_service_set_dispatch_allowed(false);
     session_requested = true;
     conversation_active = false;
     reminder_requested = false;
@@ -493,8 +504,17 @@ static void poll_reminder(void)
     app_state_pause_silence_timer();
     reminder_deadline_ms = now_ms() + 360000;
     app_state_set(APP_STATE_REMINDER_WAITING);
+    wake_word_set_audio_buffer_enabled(false);
+    /* 提醒只下行播放；关闭 WakeNet 避免播报内容唤醒自己，不启动麦克风上传。
+     * 复用现有 Wi-Fi 音频模式，结束路径的 audio_in_stop 会恢复省电。 */
+    if (wake_word_set_mode(WAKE_WORD_MODE_LITE) != ESP_OK) {
+        end_conversation("reminder AFE setup failed");
+        return;
+    }
+    (void)wifi_service_set_audio_active(true);
     retry_at_ms = now_ms();
-    ESP_LOGI(TAG, "Reminder selected: id=%s; connecting without microphone upload", reminder_task->message.id);
+    ESP_LOGI(TAG, "Reminder selected: task_count=%u; connecting without microphone upload",
+             reminder_task->count);
 }
 
 static void main_task(void *arg)
@@ -603,11 +623,11 @@ static void main_task(void *arg)
                 auth_deadline_ms = retry_at_ms = 0;
                 awaiting_voice_auth = false;
                 if (reminder_task) {
-                    /* 无 listening/无 microphone upload；播放器继续负责排空判定。 */
+                    /* auth 首帧已携带 task_ids；无 listening/麦克风上传，等待智能体下行音频。 */
                     app_state_set(APP_STATE_PLAYING);
                     reminder_requested = true;
-                    if (ws_service_request_reminder(reminder_task->message.payload) != ESP_OK)
-                        end_conversation("reminder request failed");
+                    ESP_LOGI(TAG, "Reminder session authenticated; waiting for agent audio: task_count=%u",
+                             reminder_task->count);
                     break;
                 }
                 ESP_LOGI(TAG, "WebSocket authenticated; audio upload ready");
@@ -647,16 +667,19 @@ static void main_task(void *arg)
                 /* worker 已设播放门；下方轮询当前 offer，麦克风始终上传。 */
                 break;
             case EV_AUDIO_OUT_START:
-                if (conversation_active && current_state == APP_STATE_PLAYING &&
+                if ((conversation_active || (reminder_task && reminder_requested)) &&
+                    current_state == APP_STATE_PLAYING &&
                     ws_service_get_state() == WS_STATE_CONNECTED) {
-                    response_deadline_ms = now_ms() + 180000;
+                    if (conversation_active) response_deadline_ms = now_ms() + 180000;
                     led_set_speaking();
                 }
                 break;
             case EV_WS_RESPONSE_DONE:
                 if (reminder_task && reminder_requested) {
-                    /* 此事件由 WS worker 在有解码音频且 PCM 已排空时产生。 */
-                    device_mqtt_service_finish_task(reminder_task, true);
+                    /* 事件排队期间可能已有下一段 created；不能提前确认整批任务。 */
+                    if (!ws_service_reply_finished()) break;
+                    /* 只有音频边界完成且 PCM 排空后，服务才允许持久化并回执。 */
+                    device_mqtt_service_finish_tasks(reminder_task, DEVICE_TASK_AUDIO_RECEIVED);
                     reminder_task = NULL;
                     end_conversation("reminder playback completed");
                     break;
@@ -682,6 +705,10 @@ static void main_task(void *arg)
         int64_t now = now_ms();
         device_handshake_service_poll(wifi_service_get_state() == WIFI_STATE_GOT_IP &&
                                       !provisioning_service_is_active());
+        device_mqtt_service_set_dispatch_allowed(
+            wifi_service_get_state() == WIFI_STATE_GOT_IP &&
+            !provisioning_service_is_active() && !session_requested &&
+            app_state_get() == APP_STATE_WAIT_WAKE);
         device_mqtt_service_poll(device_handshake_service_is_enabled() && !device_handshake_service_is_blocked() &&
             wifi_service_get_state() == WIFI_STATE_GOT_IP && !provisioning_service_is_active(),
             device_handshake_service_mqtt_epoch(), device_handshake_service_get_configuration());

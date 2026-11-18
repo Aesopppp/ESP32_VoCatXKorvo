@@ -21,13 +21,14 @@ def main():
                               'static const char mqtt_ca[] = "test-only-ca";')
     (output / "device_mqtt_service.inc").write_text(service, encoding="utf-8")
     cases = {"protocol": ["tests/device_mqtt_checks.c"],
+             "storage": ["tests/device_mqtt_storage_checks.c"],
              "service": ["-Itests/ui_host", "-Iwork/device-mqtt", "tests/device_mqtt_service_checks.c"],
              "missing-ca": ["-DTEST_NO_CA=1", "-Itests/ui_host", "-Iwork/device-mqtt", "tests/device_mqtt_service_checks.c"],
              "undefined-voice": ["-DDEVICE_MQTT_FORWARD_TASK_TO_WS=0", "-Itests/ui_host", "-Iwork/device-mqtt", "tests/device_mqtt_service_checks.c"]}
     for name, sources in cases.items():
         executable = output / f"{name}-checks.exe"
         command = [args.cc, "-std=c11", "-Wall", "-Werror", "-Imanaged_components/espressif__cjson/cJSON",
-                   "-o", str(executable), *sources, "main/device_mqtt_protocol.c", "main/device_handshake.c",
+                   "-o", str(executable), *sources, "main/device_mqtt_protocol.c", "main/device_mqtt_storage.c", "main/device_handshake.c",
                    "managed_components/espressif__cjson/cJSON/cJSON.c"]
         with (output / f"{name}.log").open("w", encoding="utf-8") as log:
             for run in (command, [str(executable)]):

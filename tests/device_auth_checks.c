@@ -7,6 +7,7 @@
 #include "../main/device_handshake_service.h"
 #include "../main/device_handshake_http.h"
 #include "../main/ws_service.h"
+#include "../main/device_mqtt_service.h"
 #include "cJSON.h"
 
 #define ESP_ERR_INVALID_SIZE 5
@@ -49,7 +50,9 @@ static ws_conn_state_t state;
 static bool client_started, credentials_from_handshake, fail_alloc, fail_client, fail_send, fail_stop;
 static proto_ws_credentials_t *credentials;
 static unsigned creates, stops, connects, recoveries, ends;
-static char sent[PROTO_AUTH_FRAME_SIZE], source_name[80], configured_url[PROTO_WS_URL_MAX + 1];
+static char sent[PROTO_REMINDER_AUTH_FRAME_SIZE], source_name[80], configured_url[PROTO_WS_URL_MAX + 1];
+static size_t reminder_task_count;
+static char reminder_device_id[65], reminder_task_ids[PROTO_REMINDER_TASK_IDS_MAX][129];
 static void *heap_caps_calloc(size_t count, size_t size, int caps)
 { (void)caps; return fail_alloc ? NULL : calloc(count, size); }
 static void *heap_caps_malloc(size_t size, int caps)
@@ -74,7 +77,14 @@ int esp_websocket_client_send_text(esp_websocket_client_handle_t handle, const c
 #include "ws_service.c.inc"
 
 static bool session_requested, voice_auth_refresh_used, awaiting_voice_auth, waiting_for_credentials;
-static void *reminder_task;
+static device_mqtt_delivery_t *reminder_task;
+esp_err_t ws_service_prepare_reminder(const char *device_id, const char *const *ids, size_t count)
+{
+    CHECK(count>0 && count<=PROTO_REMINDER_TASK_IDS_MAX && !client_started);
+    strcpy(reminder_device_id,device_id); reminder_task_count=count;
+    for(size_t i=0;i<count;++i) strcpy(reminder_task_ids[i],ids[i]);
+    return ESP_OK;
+}
 static int64_t retry_at_ms, auth_deadline_ms;
 static bool network_ready, provisioning;
 static int wifi_service_get_state(void) { return network_ready ? WIFI_STATE_GOT_IP : 0; }
@@ -117,6 +127,7 @@ static void fresh(void)
     sent[0] = source_name[0] = configured_url[0] = 0;
     session_requested = network_ready = true; provisioning = false;
     voice_auth_refresh_used = awaiting_voice_auth = waiting_for_credentials = false;
+    reminder_task=NULL; reminder_task_count=0; reminder_device_id[0]=0;
     retry_at_ms = test_now; auth_deadline_ms = 0;
 }
 
@@ -141,6 +152,24 @@ static void builder_checks(void)
     CHECK(!proto_build_auth_frame(buffer, sizeof(buffer), ""));
     CHECK(!proto_build_auth_frame(buffer, sizeof(buffer), NULL));
     CHECK(!proto_build_auth_frame(NULL, sizeof(buffer), "test"));
+    char reminder_buffer[PROTO_REMINDER_AUTH_FRAME_SIZE];
+    const char *task_ids[] = { "42", "43" };
+    size_t reminder_length = proto_build_reminder_auth_frame(reminder_buffer,
+        sizeof(reminder_buffer), "jwt-token", "dev-123", task_ids, 2);
+    CHECK(reminder_length == strlen(reminder_buffer) && reminder_length > 0);
+    cJSON *reminder = cJSON_Parse(reminder_buffer); CHECK(reminder != NULL);
+    CHECK(!strcmp(cJSON_GetObjectItemCaseSensitive(reminder, "type")->valuestring, "auth"));
+    CHECK(!strcmp(cJSON_GetObjectItemCaseSensitive(reminder, "api_key")->valuestring, "jwt-token"));
+    CHECK(!strcmp(cJSON_GetObjectItemCaseSensitive(reminder, "device_id")->valuestring, "dev-123"));
+    cJSON *ids = cJSON_GetObjectItemCaseSensitive(reminder, "task_ids");
+    CHECK(cJSON_GetArraySize(ids) == 2);
+    CHECK(!strcmp(cJSON_GetArrayItem(ids, 0)->valuestring, "42"));
+    CHECK(!strcmp(cJSON_GetArrayItem(ids, 1)->valuestring, "43"));
+    cJSON_Delete(reminder);
+    CHECK(!proto_build_reminder_auth_frame(reminder_buffer, sizeof(reminder_buffer),
+        "jwt-token", "dev-123", (const char *const[]){"42", "x"}, 2));
+    CHECK(!proto_build_reminder_auth_frame(reminder_buffer, sizeof(reminder_buffer),
+        "jwt-token", "dev-123", task_ids, 0));
     proto_msg_t msg;
     CHECK(proto_parse_json("{\"type\":\"error\",\"code\":2000}", &msg) == PROTO_OK);
     CHECK(proto_is_auth_error(&msg));
@@ -154,6 +183,16 @@ static void builder_checks(void)
 
 static void connection_checks(void)
 {
+    fresh();
+    device_mqtt_delivery_t batch={.device_id="dev-123",.count=2,.task_ids={"42","43"}};
+    reminder_task=&batch; retry_voice_connection(test_now);
+    CHECK(connects==1 && reminder_task_count==2);
+    state=WS_STATE_AUTHING; CHECK(ws_service_authenticate()==ESP_OK);
+    cJSON *reminder=cJSON_Parse(sent); CHECK(reminder!=NULL);
+    CHECK(!strcmp(cJSON_GetObjectItem(reminder,"api_key")->valuestring,"device-test-only"));
+    CHECK(!strcmp(cJSON_GetObjectItem(reminder,"device_id")->valuestring,"dev-123"));
+    CHECK(cJSON_GetArraySize(cJSON_GetObjectItem(reminder,"task_ids"))==2);
+    CHECK(!cJSON_GetObjectItem(reminder,"content")); cJSON_Delete(reminder);
     fresh(); s_schedule.ready = false;
     for (unsigned i = 0; i < 10; ++i) retry_voice_connection(test_now);
     CHECK(waiting_for_credentials && !stops && !connects && !credentials);

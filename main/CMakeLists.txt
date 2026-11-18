@@ -29,6 +29,7 @@ idf_component_register(
         "device_handshake_http.c"
         "device_handshake_service.c"
         "device_mqtt_protocol.c"
+        "device_mqtt_storage.c"
         "device_mqtt_service.c"
         "log_service.c"
         "provisioning_service.c"

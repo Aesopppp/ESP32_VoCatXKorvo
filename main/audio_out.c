@@ -41,6 +41,10 @@ static unsigned drain_blocks, fade_samples;
 static int16_t last_sample;
 static uint32_t underruns, supplied_samples, decoded_packets, decode_max_us, write_max_us;
 static uint32_t decode_total_us, decode_samples, decode_over_budget;
+/* 解码后、音量增益前的幅度诊断。受 output_lock 保护，只在周期/EOF 打印。
+ * 可解码不等于有声；这些统计不改变音频完成或 ACK 的业务判据。 */
+static uint32_t signal_peak, signal_samples, signal_nonzero;
+static uint64_t signal_abs_sum;
 static int64_t stats_at;
 static void playback_worker(void *arg);
 
@@ -200,6 +204,19 @@ static void ramp_to_zero(int16_t *mono, size_t from)
     size_t n=PCM_BLOCK-from;
     for(size_t i=0;i<n;++i) mono[from+i]=pcm_scale(previous,n-i-1,n);
 }
+
+static void measure_pcm_signal(const int16_t *pcm, size_t samples)
+{
+    for (size_t i=0; i<samples; ++i) {
+        int32_t sample=pcm[i]; /* 先扩展，保证 -32768 的绝对值不会溢出。 */
+        uint32_t magnitude=(uint32_t)(sample<0 ? -sample : sample);
+        if(magnitude>signal_peak) signal_peak=magnitude;
+        signal_abs_sum+=magnitude;
+        if(magnitude) ++signal_nonzero;
+    }
+    signal_samples+=(uint32_t)samples;
+}
+
 static void playback_worker(void *arg)
 {
     (void)arg;
@@ -241,15 +258,17 @@ static void playback_worker(void *arg)
         size_t buffered=pcm_count;
         uint32_t gaps=underruns, dec=decode_max_us, wr=write_max_us, samples=supplied_samples;
         uint32_t dec_total=decode_total_us, dec_audio=decode_samples, dec_slow=decode_over_budget;
+        uint32_t peak=signal_peak, mean=signal_samples ? (uint32_t)(signal_abs_sum/signal_samples) : 0;
         if(report) {
             stats_at=now; decode_max_us=write_max_us=0;
             decode_total_us=decode_samples=decode_over_budget=0;
         }
         xSemaphoreGive(output_lock);
         if(report) ESP_LOGI("audio_out", "Playback stats: buffered_ms=%u starvations=%lu decode_max_us=%lu write_max_us=%lu pcm_ms=%lu "
-            "decode_work_ms=%lu decode_audio_ms=%lu decode_slow=%lu",
+            "decode_work_ms=%lu decode_audio_ms=%lu decode_slow=%lu pcm_peak=%lu pcm_mean_abs=%lu",
             (unsigned)(buffered/16),(unsigned long)gaps,(unsigned long)dec,(unsigned long)wr,(unsigned long)(samples/16),
-            (unsigned long)(dec_total/1000),(unsigned long)(dec_audio/16),(unsigned long)dec_slow);
+            (unsigned long)(dec_total/1000),(unsigned long)(dec_audio/16),(unsigned long)dec_slow,
+            (unsigned long)peak,(unsigned long)mean);
         if(err!=ESP_OK) { event_bus_publish(EV_AUDIO_INPUT_ERROR,NULL,0); vTaskDelay(pdMS_TO_TICKS(20)); }
         /* Fairness between blocks even if DMA has several free descriptors. */
         vTaskDelay(1);
@@ -289,11 +308,13 @@ esp_err_t audio_out_read_afe_input(int16_t *pcm,size_t bytes)
 void audio_out_set_streaming(bool active)
 {
     xSemaphoreTake(output_lock,portMAX_DELAY);
+    bool report=!active && stream_open && !stream_eof;
     if(active && !stream_open) {
         pcm_read=pcm_write=pcm_count=0;
         stream_open=true; stream_eof=false; stream_drained=false; output_started=false;
         drain_blocks=0; underruns=supplied_samples=decoded_packets=decode_max_us=write_max_us=0;
         decode_total_us=decode_samples=decode_over_budget=0;
+        signal_peak=signal_samples=signal_nonzero=0; signal_abs_sum=0;
         stats_at=esp_timer_get_time(); state=AUDIO_OUT_STATE_PLAYING;
     } else if(active && stream_eof) {
         /* 同一回复的下一音频段：撤销 EOF，保留尚未播出的 PCM 和 DMA 尾音。
@@ -302,7 +323,14 @@ void audio_out_set_streaming(bool active)
     } else if(!active) {
         stream_eof=true; drain_blocks=0; /* flush even replies shorter than prefill */
     }
+    uint32_t peak=signal_peak, samples=signal_samples, nonzero=signal_nonzero;
+    uint32_t mean=samples ? (uint32_t)(signal_abs_sum/samples) : 0;
+    int volume=atomic_load(&output_volume);
     xSemaphoreGive(output_lock);
+    /* 短于 5 秒的提醒也有摘要，便于区分静音数据、音量为零与输出链路问题。 */
+    if(report) ESP_LOGI("audio_out", "PCM signal at EOF: decoded_ms=%lu peak=%lu mean_abs=%lu nonzero=%lu/%lu volume=%d",
+        (unsigned long)(samples/(AUDIO_OUT_SAMPLE_RATE/1000)),(unsigned long)peak,(unsigned long)mean,
+        (unsigned long)nonzero,(unsigned long)samples,volume);
 }
 bool audio_out_is_streaming(void) { return atomic_load(&playback_streaming); }
 bool audio_out_is_drained(void)
@@ -322,6 +350,7 @@ int audio_out_play_opus(const uint8_t *data,size_t len)
     if(elapsed>decode_max_us) decode_max_us=elapsed;
     decode_total_us+=elapsed;
     if(samples>0) {
+        measure_pcm_signal(decode_pcm,(size_t)samples);
         decode_samples+=(uint32_t)samples;
         if(elapsed>(uint32_t)samples*1000000u/AUDIO_OUT_SAMPLE_RATE) ++decode_over_budget;
     }

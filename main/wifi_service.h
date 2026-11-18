@@ -72,7 +72,8 @@ esp_err_t wifi_service_disconnect(void);
 /**
  * @brief 连续音频上传期间关闭 modem sleep，停止后恢复默认省电模式。
  *
- * 由唯一的 audio_in 实例在主任务的 start/stop 中调用，不是引用计数接口。
+ * 普通对话由 audio_in 的 start/stop 调用；无上行提醒由主任务设为 true，
+ * 共用结束路径恢复 false。两类会话互斥；不是引用计数接口。
  * 未关联 AP 时只保存意图，重连成功后重新应用；不写 NVS、不改变连接策略。
  * 应用失败返回错误并记录日志，调用方可继续音频，不据此重建会话。
  */

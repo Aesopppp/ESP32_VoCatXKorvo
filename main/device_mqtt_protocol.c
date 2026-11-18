@@ -7,6 +7,14 @@ static bool task_id_valid(const char *id)
 {
     if (!id || !*id || strlen(id) > DEVICE_TASK_ID_MAX) return false;
     for (const unsigned char *p = (const unsigned char *)id; *p; ++p)
+        if (*p < '0' || *p > '9') return false;
+    return true;
+}
+
+static bool stored_id_valid(const char *id)
+{
+    if (!id || !*id || strlen(id) > DEVICE_TASK_ID_MAX) return false;
+    for (const unsigned char *p = (const unsigned char *)id; *p; ++p)
         if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
               (*p >= '0' && *p <= '9') || strchr("_.:-", *p))) return false;
     return true;
@@ -92,7 +100,7 @@ bool device_mqtt_history_valid(const device_mqtt_history_t *h, const char *devic
         !memchr(h->device_id, 0, sizeof(h->device_id)) || strcmp(h->device_id, device_id)) return false;
     for (unsigned i = 0; i < DEVICE_TASK_HISTORY_SIZE; ++i)
         if (!memchr(h->ids[i], 0, sizeof(h->ids[i])) ||
-            (h->ids[i][0] && !task_id_valid(h->ids[i]))) return false;
+            (h->ids[i][0] && !stored_id_valid(h->ids[i]))) return false;
     return true;
 }
 int device_mqtt_history_find(const device_mqtt_history_t *h, const char *id)

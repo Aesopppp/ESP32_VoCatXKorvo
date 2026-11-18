@@ -119,6 +119,9 @@ void wake_word_get_audio_progress(wake_word_audio_progress_t *progress);
 size_t wake_word_read_audio(int16_t *pcm, size_t capacity, uint32_t *sample_end);
 /** Flush stale PCM with the upload task stopped. */
 void wake_word_clear_audio_buffer(void);
+/* 主任务在上传已停止时切换。仅控制上传 FIFO，不停止 AFE/AEC 或共享 I2S 时钟。
+ * 提醒开始设为 false，结束回待机后恢复 true；切换时清除旧采样进度。 */
+void wake_word_set_audio_buffer_enabled(bool enabled);
 
 /**
  * @brief 获取 AFE fetch 帧大小（samples）

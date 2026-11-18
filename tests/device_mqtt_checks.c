@@ -6,16 +6,18 @@
 #include <string.h>
 static unsigned checks;
 #define CHECK(x) do { ++checks; if (!(x)) { fprintf(stderr, "FAIL %d: %s\n", __LINE__, #x); exit(1); } } while (0)
-static const char *message = "{\"task_id\":\"task-001\",\"kind\":\"reminder\",\"content\":\"该吃午饭了\",\"fire_at\":\"2020-11-03T06:00:00.000Z\"}";
+static const char *message = "{\"task_id\":\"42\",\"kind\":\"reminder\",\"content\":\"该吃午饭了\",\"fire_at\":\"2020-11-03T06:00:00.000Z\"}";
 
 static void parser_checks(void)
 {
     device_mqtt_task_t task;
     CHECK(device_mqtt_parse_task(message, strlen(message), &task));
-    CHECK(!strcmp(task.id, "task-001") && !strcmp(task.payload, message));
+    CHECK(!strcmp(task.id, "42") && !strcmp(task.payload, message));
     /* 迟到、转义内容和 Unicode 文本必须保留原报文。 */
     const char *invalid[] = { "", "{}", "[]", "null", "{\"a\":{}}", "{\"a\":[]}",
-        "{\"content\":\"bad\\u0000text\"}", "{\"task_id\":\"a\",\"task_id\":\"b\"}", "{\"content\":\"a\n\"}" };
+        "{\"content\":\"bad\\u0000text\"}", "{\"task_id\":\"a\",\"task_id\":\"b\"}",
+        "{\"task_id\":\"task-1\",\"kind\":\"reminder\",\"content\":\"x\",\"fire_at\":\"2020-11-03T06:00:00Z\"}",
+        "{\"content\":\"a\n\"}" };
     for (unsigned i = 0; i < sizeof(invalid) / sizeof(invalid[0]); ++i)
         CHECK(!device_mqtt_parse_task(invalid[i], strlen(invalid[i]), &task));
     for (size_t n = 0; n < strlen(message); ++n) CHECK(!device_mqtt_parse_task(message, n, &task));
@@ -63,7 +65,7 @@ static void history_checks(void)
     CHECK(device_mqtt_history_valid(&h, "device-1"));
     CHECK(!device_mqtt_history_valid(&h, "device-2"));
     for (unsigned i = 0; i < 64; ++i) {
-        char id[32]; snprintf(id, sizeof(id), "task-%u", i);
+        char id[32]; snprintf(id, sizeof(id), "%u", i);
         CHECK(device_mqtt_history_find(&h, id) < 0);
         unsigned slot = device_mqtt_history_add(&h, id);
         CHECK(device_mqtt_history_add(&h, id) == slot);
@@ -71,10 +73,11 @@ static void history_checks(void)
     }
     device_mqtt_history_t reboot = h;
     for (unsigned i = 32; i < 64; ++i) {
-        char id[32]; snprintf(id, sizeof(id), "task-%u", i);
+        char id[32]; snprintf(id, sizeof(id), "%u", i);
         CHECK(device_mqtt_history_find(&reboot, id) >= 0);
     }
-    CHECK(device_mqtt_history_find(&reboot, "task-0") < 0);
+    CHECK(device_mqtt_history_find(&reboot, "0") < 0);
+    CHECK(device_mqtt_history_valid(&reboot, "device-1")); /* prior history format remains readable */
     reboot.next = 32; CHECK(!device_mqtt_history_valid(&reboot, "device-1"));
     reboot = h; memset(reboot.ids[0], 'x', sizeof(reboot.ids[0]));
     CHECK(!device_mqtt_history_valid(&reboot, "device-1"));

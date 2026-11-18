@@ -89,6 +89,9 @@ typedef struct {
 #define PROTO_WS_URL_MAX 1024
 #define PROTO_AUTH_TOKEN_MAX 2048
 #define PROTO_AUTH_FRAME_SIZE (PROTO_AUTH_TOKEN_MAX * 6 + 32)
+#define PROTO_REMINDER_TASK_IDS_MAX 8u
+#define PROTO_REMINDER_AUTH_FRAME_SIZE \
+    (PROTO_AUTH_TOKEN_MAX * 6 + 64 * 6 + PROTO_REMINDER_TASK_IDS_MAX * (128 * 6 + 4) + 192)
 typedef struct {
     char url[PROTO_WS_URL_MAX + 1];
     char token[PROTO_AUTH_TOKEN_MAX + 1];
@@ -122,6 +125,10 @@ void proto_msg_clear(proto_msg_t *msg);
  * @return          length written (>=0), 0 on failure
  */
 size_t proto_build_auth_frame(char *buf, size_t buf_size, const char *token);
+/* Reminder sessions carry device identity and the platform task IDs in auth. */
+size_t proto_build_reminder_auth_frame(char *buf, size_t buf_size, const char *token,
+                                       const char *device_id,
+                                       const char *const *task_ids, size_t task_count);
 
 /**
  * @brief Build `input_audio_buffer.append` JSON frame.

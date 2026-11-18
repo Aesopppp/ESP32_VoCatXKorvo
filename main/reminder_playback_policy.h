@@ -12,7 +12,7 @@
 REMINDER_INLINE bool reminder_playback_expired(uint32_t now_ms, uint32_t started_ms,
                                               uint32_t last_rx_ms, bool network_done)
 {
-    /* uint32_t 差值兼容约 49 天的时钟回绕；所有窗口远小于半周期。 */
+    /* 30 秒无首帧/断流失败；已有结束边界时允许尾音排空，总时限防止播放器挂死。 */
     return network_done ? (uint32_t)(now_ms - started_ms) >= 360000u :
         ((uint32_t)(now_ms - started_ms) >= 300000u ||
          (uint32_t)(now_ms - last_rx_ms) >= 30000u);

@@ -27,6 +27,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include "esp_err.h"
 #include "esp_websocket_client.h"
 
@@ -97,10 +98,10 @@ uint32_t ws_service_generation(void);
 /** 主任务超时诊断：仅记录回复阶段/音频计数，不输出请求正文。 */
 void ws_service_log_response_wait(void);
 
-/** 主任务调用：先开放独立回复接收门，再原样转发提醒 JSON。
- * 期间 send_opus_frame 拒绝麦克风上传；不启动 audio_in。
- * 调用可阻塞至一次 WS send 超时（1 秒），不能在网络回调中调用。 */
-esp_err_t ws_service_request_reminder(const char *payload);
+/** 主任务在断连、播放器空闲时调用；复制上下文，首条 auth 携带 task_ids。
+ * 提前打开下行接收门；不发送网络消息、不启动麦克风上传，disconnect 清理上下文。 */
+esp_err_t ws_service_prepare_reminder(const char *device_id,
+                                      const char *const *task_ids, size_t task_count);
 bool ws_service_reminder_timed_out(void);
 
 /** Generic JSON text send (for future protocol extensions). */
